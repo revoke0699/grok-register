@@ -8,6 +8,7 @@ const EMAIL_PROVIDER_LABELS: Record<string, string> = {
   yyds: "YYDS 邮箱",
   mailnest: "MailNest",
   cloudmail: "CloudMail",
+  icloud: "iCloud 邮箱",
   history: "历史文件",
 };
 

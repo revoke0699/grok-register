@@ -305,7 +305,11 @@ class OpenSignupPageExitIpTests(unittest.TestCase):
             signup_flow.open_signup_page()
         prepare.assert_called_once()
         set_session.assert_called_once()
-        page.get.assert_called_once_with(signup_flow.SIGNUP_URL)
+        page.get.assert_called_once_with(
+            signup_flow.SIGNUP_URL,
+            wait_until="domcontentloaded",
+            timeout=signup_flow.SIGNUP_NAVIGATION_TIMEOUT_MS,
+        )
 
 
 if __name__ == "__main__":

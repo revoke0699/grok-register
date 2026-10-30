@@ -1,4 +1,4 @@
-import { memo, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   ArrowDownToLine,
@@ -14,14 +14,16 @@ import {
   MoreHorizontal,
   Play,
   RotateCcw,
-  Search,
   Square,
   TerminalSquare,
   Wifi,
   X,
   XCircle,
 } from "lucide-react";
+import { HighlightedLogLine } from "@/components/HighlightedLogLine";
+import { LogSearchField } from "@/components/LogSearchField";
 import { api, type AccountRecord, type JobStatus, type LogItem } from "@/lib/api";
+import { clampMatchIndex, collectLogMatches } from "@/lib/logSearch";
 import {
   Badge,
   Button,
@@ -41,7 +43,7 @@ import { cn } from "@/lib/utils";
 
 type BusyAction = "" | "start" | "stop" | "check" | "kill";
 type LogTone = "default" | "success" | "error" | "warn" | "info";
-type DisplayLogItem = LogItem & { tone: LogTone; searchText: string };
+type DisplayLogItem = LogItem & { tone: LogTone };
 
 const MAX_LOG_BUFFER = 2000;
 const DEFAULT_RENDERED_LOGS = 300;
@@ -135,14 +137,6 @@ const ElapsedTime = memo(function ElapsedTime({
   return <>{formatDuration(Math.max(0, (endMs - startedAt * 1000) / 1000))}</>;
 });
 
-const LogLine = memo(function LogLine({ item }: { item: DisplayLogItem }) {
-  return (
-    <div className="border-b border-slate-200/60 py-0.5 last:border-0 [contain-intrinsic-size:auto_24px] [content-visibility:auto]">
-      <span className="text-sky-600">[{item.time}]</span>{" "}
-      <span className={cn("whitespace-pre-wrap break-all", logToneClass[item.tone])}>{item.message}</span>
-    </div>
-  );
-});
 
 export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const [count, setCount] = useState("1");
@@ -155,6 +149,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const [showJumpBottom, setShowJumpBottom] = useState(false);
   const [logQuery, setLogQuery] = useState("");
   const [logLevel, setLogLevel] = useState<"all" | LogTone>("all");
+  const [activeMatchIndex, setActiveMatchIndex] = useState(0);
   const [busyAction, setBusyAction] = useState<BusyAction>("");
   const [jobPolling, setJobPolling] = useState(true);
   const [checks, setChecks] = useState<Array<{ name: string; ok: boolean; detail: string }>>([]);
@@ -169,6 +164,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     message: "",
   });
   const logRef = useRef<HTMLDivElement | null>(null);
+  const lastFocusedMatchRef = useRef("");
   const afterIdRef = useRef(0);
   const logViewVersionRef = useRef(0);
   const pollingRef = useRef(false);
@@ -186,23 +182,23 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
   const successRate =
     progressCompleted > 0 ? Math.round((successCount / Math.max(progressCompleted, 1)) * 100) : null;
 
-  const deferredLogQuery = useDeferredValue(logQuery);
+  const query = logQuery.trim();
+  const searching = Boolean(query);
 
-  const filteredLogs = useMemo(() => {
-    const q = deferredLogQuery.trim().toLowerCase();
-    if (!q && logLevel === "all") return logs;
-    return logs.filter((item) => {
-      if (logLevel !== "all" && item.tone !== logLevel) return false;
-      if (!q) return true;
-      return item.searchText.includes(q);
-    });
-  }, [logs, deferredLogQuery, logLevel]);
+  const levelLogs = useMemo(() => {
+    if (logLevel === "all") return logs;
+    return logs.filter((item) => item.tone === logLevel);
+  }, [logs, logLevel]);
+
+  const matches = useMemo(() => collectLogMatches(levelLogs, query), [levelLogs, query]);
+  const safeMatchIndex = clampMatchIndex(activeMatchIndex, matches.length);
+  const currentMatch = matches[safeMatchIndex] || null;
 
   const renderedLogs = useMemo(
-    () => filteredLogs.slice(-renderedLogLimit),
-    [filteredLogs, renderedLogLimit]
+    () => levelLogs.slice(-renderedLogLimit),
+    [levelLogs, renderedLogLimit]
   );
-  const hiddenFilteredLogCount = Math.max(filteredLogs.length - renderedLogs.length, 0);
+  const hiddenFilteredLogCount = Math.max(levelLogs.length - renderedLogs.length, 0);
   const latestRenderedLogId = renderedLogs[renderedLogs.length - 1]?.id || 0;
 
   const showToast = (message: string, tone: "default" | "success" | "error" = "default") => {
@@ -227,7 +223,6 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
         const preparedLogs = freshLogs.map((item) => ({
           ...item,
           tone: detectLogTone(item.message),
-          searchText: `${item.time || ""}\n${item.message}`.toLowerCase(),
         }));
         setLogs((prev) => [...prev, ...preparedLogs].slice(-MAX_LOG_BUFFER));
         afterIdRef.current = freshLogs[freshLogs.length - 1].id;
@@ -315,14 +310,44 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
 
   useEffect(() => {
     setRenderedLogLimit(DEFAULT_RENDERED_LOGS);
-  }, [deferredLogQuery, logLevel]);
+  }, [logLevel]);
 
   useEffect(() => {
-    if (autoScroll && !userPinnedRef.current && logRef.current) {
+    setActiveMatchIndex(matches.length ? matches.length - 1 : 0);
+    lastFocusedMatchRef.current = "";
+  }, [query, logLevel]);
+
+  useEffect(() => {
+    setActiveMatchIndex((current) => clampMatchIndex(current, matches.length));
+  }, [matches.length]);
+
+  useEffect(() => {
+    if (autoScroll && !userPinnedRef.current && !searching && logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
       setShowJumpBottom(false);
     }
-  }, [latestRenderedLogId, autoScroll]);
+  }, [latestRenderedLogId, autoScroll, searching]);
+
+  useEffect(() => {
+    if (!currentMatch) return;
+    const needed = levelLogs.length - currentMatch.lineIndex;
+    if (needed > renderedLogLimit) {
+      setRenderedLogLimit(needed);
+      return;
+    }
+    const focusKey = `${currentMatch.logId}:${currentMatch.occurrence}`;
+    if (lastFocusedMatchRef.current === focusKey) return;
+    userPinnedRef.current = true;
+    setShowJumpBottom(true);
+    window.requestAnimationFrame(() => {
+      const root = logRef.current;
+      if (!root) return;
+      lastFocusedMatchRef.current = focusKey;
+      const mark = root.querySelector(`[data-log-match="${currentMatch.logId}-${currentMatch.occurrence}"]`);
+      const line = root.querySelector(`[data-log-id="${currentMatch.logId}"]`);
+      (mark || line)?.scrollIntoView({ block: "center", inline: "nearest" });
+    });
+  }, [currentMatch?.logId, currentMatch?.occurrence, currentMatch?.lineIndex, renderedLogLimit, levelLogs.length]);
 
   useEffect(() => {
     if (!opsOpen && !checksOpen && !resultDetail) return;
@@ -358,7 +383,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     const previousHeight = el?.scrollHeight || 0;
     const previousTop = el?.scrollTop || 0;
     setRenderedLogLimit((current) =>
-      Math.min(filteredLogs.length, current + LOG_RENDER_STEP)
+      Math.min(levelLogs.length, current + LOG_RENDER_STEP)
     );
     window.requestAnimationFrame(() => {
       if (!el) return;
@@ -442,15 +467,21 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
     showToast(job?.running ? "视图已清空，将继续接收新日志" : "日志视图已清空");
   };
 
+  const goToMatch = (index: number) => {
+    if (!matches.length) return;
+    lastFocusedMatchRef.current = "";
+    setActiveMatchIndex((index + matches.length) % matches.length);
+  };
+
   const copyVisibleLogs = async () => {
-    const text = filteredLogs.map((item) => `[${item.time}] ${item.message}`).join("\n");
+    const text = levelLogs.map((item) => `[${item.time}] ${item.message}`).join("\n");
     if (!text) {
       showToast("没有可复制的日志", "error");
       return;
     }
     try {
       await navigator.clipboard.writeText(text);
-      showToast(`已复制 ${filteredLogs.length} 行日志`, "success");
+      showToast(`已复制 ${levelLogs.length} 行日志`, "success");
     } catch {
       showToast("复制失败，请手动选择文本", "error");
     }
@@ -745,8 +776,8 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
               <span>{job?.running ? "任务执行中，日志会持续同步" : "当前没有运行中的注册任务"}</span>
               <span className="tabular-nums">
                 视图缓冲 {logs.length} 行
-                {filteredLogs.length !== logs.length ? ` · 筛选后 ${filteredLogs.length}` : ""}
-                {renderedLogs.length !== filteredLogs.length ? ` · 当前渲染 ${renderedLogs.length}` : ""}
+                {levelLogs.length !== logs.length ? ` · 筛选后 ${levelLogs.length}` : ""}
+                {renderedLogs.length !== levelLogs.length ? ` · 当前渲染 ${renderedLogs.length}` : ""}
                 {" · "}
                 源 {job?.source || "—"}
               </span>
@@ -954,15 +985,14 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
           </div>
 
           <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
-            <div className="relative min-w-0 flex-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-              <Input
-                value={logQuery}
-                onChange={(event) => setLogQuery(event.target.value)}
-                placeholder="搜索日志内容或时间…"
-                className="h-9 pl-9"
-              />
-            </div>
+            <LogSearchField
+              query={logQuery}
+              matchCount={matches.length}
+              activeIndex={safeMatchIndex}
+              onQueryChange={setLogQuery}
+              onPrev={() => goToMatch(safeMatchIndex - 1)}
+              onNext={() => goToMatch(safeMatchIndex + 1)}
+            />
             <div className="flex flex-wrap items-center gap-1.5">
               {levelFilters.map((item) => (
                 <button
@@ -1002,7 +1032,8 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
               {job?.running ? "日志持续同步中" : "等待新任务"}
             </span>
             <span className="tabular-nums">
-              完成 {progressCompleted} · 显示 {renderedLogs.length} / {filteredLogs.length} · 缓冲 {logs.length}
+              完成 {progressCompleted} · 显示 {renderedLogs.length} / {levelLogs.length} · 缓冲 {logs.length}
+              {searching ? ` · 匹配 ${matches.length ? `${safeMatchIndex + 1}/${matches.length}` : 0}` : ""}
             </span>
           </div>
 
@@ -1018,7 +1049,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
             aria-live="off"
             className="font-mono-log h-[50dvh] min-h-[360px] max-h-[640px] overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs leading-6 sm:h-[540px] sm:p-4"
           >
-            {filteredLogs.length === 0 ? (
+            {levelLogs.length === 0 ? (
               <div className="flex h-full min-h-40 flex-col items-center justify-center gap-2 text-center text-slate-500">
                 <div>
                   {logs.length === 0
@@ -1050,7 +1081,13 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                   </div>
                 ) : null}
                 {renderedLogs.map((item) => (
-                  <LogLine key={item.id} item={item} />
+                  <HighlightedLogLine
+                    key={item.id}
+                    item={item}
+                    query={query}
+                    activeOccurrence={currentMatch?.logId === item.id ? currentMatch.occurrence : -1}
+                    toneClassName={logToneClass[item.tone]}
+                  />
                 ))}
               </>
             )}

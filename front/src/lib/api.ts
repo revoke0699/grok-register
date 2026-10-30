@@ -1,3 +1,39 @@
+export type BrowserCacheEntry = {
+  id: string;
+  url: string;
+  host: string;
+  path: string;
+  content_type: string;
+  status: number;
+  size: number;
+  scope: "standard" | "more" | "unknown" | string;
+  risk_level?: "high" | "medium" | "low" | "unknown" | string;
+  risk_reasons?: string[];
+  replay_safe?: boolean;
+  active: boolean;
+  cached_at: string;
+  mtime: number;
+};
+
+export type BrowserCacheSnapshot = {
+  enabled: boolean;
+  savings_level: string;
+  root: string;
+  total_bytes: number;
+  max_total_bytes: number;
+  max_entry_bytes: number;
+  entry_count: number;
+  active_count: number;
+  active_bytes: number;
+  high_risk_count?: number;
+  medium_risk_count?: number;
+  high_risk_bytes?: number;
+  refills_on_miss: boolean;
+  deleted_files?: number;
+  errors?: number;
+  entries: BrowserCacheEntry[];
+};
+
 export type JobStatus = {
   running: boolean;
   started_at?: number | null;
@@ -175,6 +211,7 @@ export type ReloginItem = {
   error: string;
   stage?: string;
   error_type?: string;
+  failure_type?: string;
   url?: string;
   page_title?: string;
   visible_error?: string;
@@ -194,6 +231,7 @@ export type ReloginItem = {
 
 export type ReloginStatus = {
   running: boolean;
+  stopping?: boolean;
   account_id: number;
   email: string;
   stage: string;
@@ -205,6 +243,8 @@ export type ReloginStatus = {
   success_count: number;
   failed_count: number;
   run_id: string;
+  log_count?: number;
+  latest_log_id?: number;
   items: ReloginItem[];
 };
 
@@ -439,6 +479,14 @@ export const api = {
     }),
   reloginStatus: () =>
     request<{ ok: boolean; relogin: ReloginStatus }>("/api/accounts/relogin/status"),
+  reloginLogs: (afterId = 0, limit = 500) =>
+    request<{ ok: boolean; logs: LogItem[]; relogin: ReloginStatus }>(
+      `/api/accounts/relogin/logs?after_id=${afterId}&limit=${limit}`
+    ),
+  stopRelogin: () =>
+    request<{ ok: boolean; relogin: ReloginStatus }>("/api/accounts/relogin/stop", {
+      method: "POST",
+    }),
   startSsoCheck: (ids: number[]) =>
     request<{ ok: boolean; sso_check: SsoCheckStatus }>("/api/accounts/sso-check", {
       method: "POST",
@@ -494,6 +542,9 @@ export const api = {
       "/api/browser/kill-all",
       { method: "POST" }
     ),
+  browserCache: () => request<{ ok: boolean } & BrowserCacheSnapshot>("/api/browser/cache"),
+  clearBrowserCache: () =>
+    request<{ ok: boolean } & BrowserCacheSnapshot>("/api/browser/cache/clear", { method: "POST" }),
   connectivity: () =>
     request<{ ok: boolean; items: Array<{ name: string; ok: boolean; detail: string }>; blocked: boolean }>(
       "/api/connectivity",

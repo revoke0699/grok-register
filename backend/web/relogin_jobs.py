@@ -5,6 +5,7 @@ Web 请求只负责启动任务；浏览器登录、SSO 刷新与授权文件重
 """
 from __future__ import annotations
 
+import collections
 import datetime
 import os
 import threading
@@ -12,7 +13,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Deque, Dict, Iterable, List, Optional
 from urllib.parse import quote
 
 
@@ -47,7 +48,7 @@ def enqueue_relogin_grokiq_notification(
 
 
 class ReloginJobCoordinator:
-    def __init__(self) -> None:
+    def __init__(self, max_logs: int = 2000) -> None:
         self._lock = threading.RLock()
         self._running = False
         self._account_id = 0
@@ -63,11 +64,15 @@ class ReloginJobCoordinator:
         self._run_id = ""
         self._items: List[Dict[str, Any]] = []
         self._thread: Optional[threading.Thread] = None
+        self._logs: Deque[Dict[str, Any]] = collections.deque(maxlen=max(100, int(max_logs)))
+        self._log_seq = 0
+        self._stop_requested = False
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
             return {
                 "running": self._running,
+                "stopping": self._running and self._stop_requested,
                 "account_id": self._account_id,
                 "email": self._email,
                 "stage": self._stage,
@@ -79,6 +84,8 @@ class ReloginJobCoordinator:
                 "success_count": self._success_count,
                 "failed_count": self._failed_count,
                 "run_id": self._run_id,
+                "log_count": len(self._logs),
+                "latest_log_id": self._log_seq,
                 # 逐条浅拷贝：list() 的元素仍是同一批可变 dict，会把内部状态泄漏给调用方。
                 "items": [dict(item) for item in self._items],
             }
@@ -87,6 +94,29 @@ class ReloginJobCoordinator:
         with self._lock:
             for key, value in values.items():
                 setattr(self, f"_{key}", value)
+
+    def _append_log(self, message: str) -> None:
+        text = str(message or "")
+        if not text:
+            return
+        with self._lock:
+            self._log_seq += 1
+            self._logs.append(
+                {
+                    "id": self._log_seq,
+                    "time": time.strftime("%H:%M:%S"),
+                    "message": text,
+                }
+            )
+
+    def get_logs(self, after_id: int = 0, limit: int = 500) -> List[Dict[str, Any]]:
+        safe_limit = max(1, min(int(limit or 500), 2000))
+        threshold = max(0, int(after_id or 0))
+        with self._lock:
+            items = [dict(item) for item in self._logs if int(item["id"]) > threshold]
+        if len(items) > safe_limit:
+            items = items[-safe_limit:]
+        return items
 
     def start(self, account_id: int) -> Dict[str, Any]:
         return self.start_many([account_id])
@@ -167,6 +197,17 @@ class ReloginJobCoordinator:
             # 与计数同锁赋值，避免并发 status() 读到「新计数 + 旧 items」。
             self._run_id = uuid.uuid4().hex
             self._items = seed_items
+            self._logs.clear()
+            self._stop_requested = False
+
+        self._append_log(
+            f"[*] 重新登录任务启动：共 {len(normalized_ids)} 个账号，可执行 {len(runnable)} 个"
+        )
+        for item in seed_items:
+            if item.get("status") != "failed":
+                continue
+            label = item.get("email") or f"账号 {item.get('account_id')}"
+            self._append_log(f"[!] {label}: {item.get('error')}")
 
         job_items = seed_items
         job_index = {int(item["account_id"]): item for item in job_items}
@@ -174,19 +215,42 @@ class ReloginJobCoordinator:
         def runner() -> None:
             try:
                 for record in runnable:
+                    with self._lock:
+                        stop_requested = self._stop_requested
+                    if stop_requested:
+                        skipped = 0
+                        with self._lock:
+                            for item in job_items:
+                                if item["status"] == "pending":
+                                    item.update(status="failed", error="任务已停止")
+                                    self._completed_count += 1
+                                    self._failed_count += 1
+                                    skipped += 1
+                            self._stage = "重新登录已停止"
+                        if skipped:
+                            self._append_log(f"[!] 已停止重新登录，跳过剩余 {skipped} 个账号")
+                        else:
+                            self._append_log("[!] 已停止重新登录")
+                        break
                     error = ""
                     account_id = int(record.get("id") or 0)
+                    email = str(record.get("email") or "").strip()
                     outcome: Any = ""
                     try:
                         self._set(
                             account_id=account_id,
-                            email=str(record.get("email") or "").strip(),
+                            email=email,
                             stage="启动浏览器",
                         )
+                        self._append_log(f"[*] 开始重新登录: {email or account_id}")
                         outcome = self._run_record(record, store)
                         error = str(outcome.get("error") or "") if isinstance(outcome, dict) else str(outcome or "")
                     except Exception as exc:
                         error = str(exc) or exc.__class__.__name__
+                    if error:
+                        self._append_log(f"[!] {email or account_id}: {error}")
+                    else:
+                        self._append_log(f"[*] {email or account_id} 重新登录成功")
                     with self._lock:
                         item = job_index.get(account_id)
                         if item is not None:
@@ -195,7 +259,7 @@ class ReloginJobCoordinator:
                             item["error"] = str(error)[:500]
                             if isinstance(outcome, dict):
                                 for key in (
-                                    "stage", "error_type", "url", "page_title", "visible_error",
+                                    "stage", "error_type", "failure_type", "url", "page_title", "visible_error",
                                     "page_text", "controls", "screenshot_url", "traceback",
                                     "screenshot_name", "captured_at",
                                 ):
@@ -225,7 +289,15 @@ class ReloginJobCoordinator:
                             self._completed_count += 1
                             self._failed_count += 1
                     failed = [item for item in job_items if item["status"] == "failed"]
-                    if self._total_count == 1:
+                    if self._stop_requested:
+                        self._stage = "重新登录已停止"
+                        if self._total_count == 1:
+                            self._error = failed[0]["error"] if failed else "任务已停止"
+                        else:
+                            self._error = (
+                                f"{self._failed_count} 个账号未完成" if failed else "任务已停止"
+                            )
+                    elif self._total_count == 1:
                         self._stage = "重新登录失败" if failed else "重新登录完成"
                         self._error = failed[0]["error"] if failed else ""
                     else:
@@ -235,6 +307,7 @@ class ReloginJobCoordinator:
                         self._error = f"{self._failed_count} 个账号重新登录失败" if failed else ""
                     self._running = False
                     self._finished_at = time.time()
+                self._append_log("[*] 重新登录任务已结束")
 
         self._thread = threading.Thread(
             target=runner,
@@ -255,21 +328,39 @@ class ReloginJobCoordinator:
             raise
         return self.status()
 
+    def request_stop(self) -> Dict[str, Any]:
+        with self._lock:
+            running = self._running
+            if running:
+                self._stop_requested = True
+                self._stage = "正在停止"
+        if not running:
+            return self.status()
+        self._append_log("[!] 已请求停止重新登录任务")
+        try:
+            from backend.registration import engine as gr
+            gr._bs.interrupt_browser_work(log_callback=self._append_log)
+        except Exception as exc:
+            self._append_log(f"[!] 中断浏览器失败: {exc}")
+        return self.status()
+
+    def stop(self) -> Dict[str, Any]:
+        return self.request_stop()
+
     def _run_record(self, record: Dict[str, Any], store: Any) -> Dict[str, Any]:
         from backend.automation.session import stop_browser
         from backend.registration import engine as gr
         from backend.registration.login_flow import (
+            InvalidLoginCredentials,
             capture_login_diagnostics,
             capture_login_failure,
             login_with_password,
         )
-        from backend.web.sso_check_jobs import inspect_sso_token
 
         account_id = int(record.get("id") or 0)
         email = str(record.get("email") or "").strip()
         password = str(record.get("password") or "")
-        # 风控检查发生在授权重建之前；若命中风控，需要保存新 SSO，同时保留
-        # 该账号原有授权文件信息，避免受控终止把旧路径清空。
+        # 上游已不再下发 bfs / botFlagSource，重登只刷新 SSO 并重建授权。
         cpa_detail: Dict[str, Any] = {
             "enabled": bool(record.get("cpa_enabled")),
             "status": str(record.get("cpa_status") or "not_attempted"),
@@ -296,39 +387,16 @@ class ReloginJobCoordinator:
             "bfs": "" if record.get("bfs") is None else str(record.get("bfs")),
         }
         account_file = ""
-        risk_state: Dict[str, Any] = {}
-        risk_compact: Dict[str, Any] = {}
-
-        def risk_outcome_fields() -> Dict[str, Any]:
-            if not risk_compact:
-                return {}
-            return {
-                "sso_check_status": str(risk_compact.get("status") or "unknown"),
-                "sso_check_verdict": str(risk_compact.get("verdict") or ""),
-                "bot_flag_source": risk_compact.get("bot_flag_source"),
-                "sso_check_error": str(risk_compact.get("error") or ""),
-                "sso_checked_at": str(risk_compact.get("checked_at") or ""),
-                "sso_check_attempts": int(risk_compact.get("attempts") or 0),
-            }
-
-        def persist_risk_result() -> None:
-            if not risk_state or not risk_compact:
-                return
-            updater = getattr(store, "update_sso_check_result", None)
-            if callable(updater):
-                saved = updater(
-                    account_id,
-                    risk_state=risk_state,
-                    status=str(risk_compact.get("status") or "unknown"),
-                )
-                if saved is False:
-                    raise RuntimeError("SSO 风控检查结果保存失败")
 
         def log(message: str) -> None:
             text = str(message or "")
+            if not text:
+                return
+            prefix = f"[{email}] " if self._total_count > 1 else ""
+            self._append_log(prefix + text)
             if "打开重新登录页" in text:
                 self._set(stage="填写邮箱和密码")
-            elif "等待 sso" in text:
+            elif "等待" in text and "SSO" in text.upper():
                 self._set(stage="等待新的 SSO")
             elif "[CPA]" in text:
                 self._set(stage="重建授权文件")
@@ -351,84 +419,6 @@ class ReloginJobCoordinator:
             os.replace(temporary, account_path)
             account_file = str(account_path)
 
-            self._set(stage="检查 SSO 风控")
-            try:
-                risk_state, risk_compact = inspect_sso_token(
-                    sso,
-                    email,
-                    proxy=gr._resolve_cpa_proxy(),
-                    user_agent=gr.get_user_agent(),
-                    mode="relogin_detailed",
-                    stage_callback=lambda stage: self._set(stage=f"SSO 风控：{stage}"),
-                )
-            except Exception as risk_exc:
-                checked_at = datetime.datetime.now(datetime.timezone.utc).isoformat(
-                    timespec="seconds"
-                )
-                risk_error = str(risk_exc) or risk_exc.__class__.__name__
-                risk_state = {
-                    "enabled": True,
-                    "mode": "relogin_detailed",
-                    "verdict": "error",
-                    "valid_session": False,
-                    "email_match": None,
-                    "checked_at": checked_at,
-                    "response_ms": 0,
-                    "error": risk_error,
-                    "bot_flag": {
-                        "found": False,
-                        "source": None,
-                        "details": "",
-                        "policy": "",
-                        "risk": None,
-                        "event": "",
-                        "denied": False,
-                    },
-                    "found": False,
-                    "flagged": False,
-                    "bot_flag_source": None,
-                    "bot_flag_details": "",
-                    "policy": "",
-                    "risk": None,
-                    "event": "",
-                    "denied": False,
-                    "attempts": 0,
-                }
-                risk_compact = {
-                    "status": "failed",
-                    "verdict": "error",
-                    "bot_flag_source": None,
-                    "valid_session": False,
-                    "email_match": None,
-                    "policy": "",
-                    "risk": None,
-                    "event": "",
-                    "checked_at": checked_at,
-                    "response_ms": 0,
-                    "attempts": 0,
-                    "error": risk_error,
-                }
-                self._set(stage="SSO 风控检查失败，继续重建授权")
-
-            cpa_detail["sso_risk_check"] = dict(risk_state)
-            if str(risk_compact.get("status") or "") == "flagged":
-                source = risk_compact.get("bot_flag_source")
-                details = str(
-                    risk_state.get("bot_flag_details")
-                    or f"botFlagSource={source},policy=unknown,event=unknown"
-                )
-                cpa_detail.update(
-                    {
-                        "bot_risk": True,
-                        "bfs": "" if source is None else source,
-                    }
-                )
-                persist_risk_result()
-                self._set(stage="SSO 风控异常")
-                raise RuntimeError(
-                    f"SSO 风控异常，已停止授权重建: botFlagSource={source} {details}"
-                )
-
             self._set(stage="重建 CPA / Grok2API 文件")
             cpa_ok = gr.add_sso_to_cpa(
                 sso,
@@ -446,7 +436,6 @@ class ReloginJobCoordinator:
                 status="success",
                 error="",
             )
-            persist_risk_result()
             enqueue_relogin_grokiq_notification(
                 store,
                 account_id,
@@ -455,11 +444,15 @@ class ReloginJobCoordinator:
                 sso=sso,
                 log_callback=log,
             )
-            return {"error": "", **risk_outcome_fields()}
+            return {"error": ""}
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
             failure_stage = str(self.status().get("stage") or "重新登录")
             diagnostic = capture_login_diagnostics()
+            if isinstance(exc, InvalidLoginCredentials) and not diagnostic.get("visible_error"):
+                diagnostic["visible_error"] = error
+            failure_type = gr.classify_failure(exc)
+            failure_reason = error if failure_type == gr.FAIL_INVALID_CREDENTIALS else ""
             trace_text = traceback.format_exc()
             captured_at = datetime.datetime.now().astimezone()
             stamp = captured_at.strftime("%Y%m%d_%H%M%S_%f")
@@ -484,20 +477,13 @@ class ReloginJobCoordinator:
                 cpa_detail=cpa_detail,
                 status="partial" if account_file else "failed",
                 error=error,
-                failure_type=(
-                    "registration_risk"
-                    if str(risk_compact.get("status") or "") == "flagged"
-                    else ""
-                ),
-                failure_reason=(
-                    error
-                    if str(risk_compact.get("status") or "") == "flagged"
-                    else ""
-                ),
+                failure_type=failure_type if failure_type == gr.FAIL_INVALID_CREDENTIALS else "",
+                failure_reason=failure_reason,
                 screenshot_path=screenshot_path,
                 diagnostics={
                     "stage": failure_stage,
                     "error_type": exc.__class__.__name__,
+                    "failure_type": failure_type if failure_type == gr.FAIL_INVALID_CREDENTIALS else "",
                     "url": diagnostic.get("url", ""),
                     "page_title": diagnostic.get("title", ""),
                     "visible_error": diagnostic.get("visible_error", ""),
@@ -509,16 +495,11 @@ class ReloginJobCoordinator:
                     "traceback": trace_text,
                 },
             )
-            # 授权重建失败也要保留已经完成的 SSO 检查；同时在 partial 更新
-            # 之后再次落库，确保明确的 clean/flagged 结论最终覆盖风险列。
-            try:
-                persist_risk_result()
-            except Exception:
-                pass
             return {
                 "error": error,
                 "stage": failure_stage,
                 "error_type": exc.__class__.__name__,
+                "failure_type": failure_type if failure_type == gr.FAIL_INVALID_CREDENTIALS else "",
                 "url": diagnostic.get("url", ""),
                 "page_title": diagnostic.get("title", ""),
                 "visible_error": diagnostic.get("visible_error", ""),
@@ -528,7 +509,6 @@ class ReloginJobCoordinator:
                 "screenshot_name": screenshot_name,
                 "captured_at": captured_at.isoformat(timespec="seconds"),
                 "traceback": trace_text[-8000:],
-                **risk_outcome_fields(),
             }
         finally:
             try:

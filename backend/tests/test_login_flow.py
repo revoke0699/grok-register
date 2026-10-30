@@ -197,7 +197,7 @@ class LoginFormTests(unittest.TestCase):
             mock.patch.object(login_flow, "_native_click_action") as entry_click,
             mock.patch.object(login_flow, "_type_login_value", return_value=True),
             mock.patch.object(login_flow, "_click_submit", return_value=True),
-            mock.patch.object(login_flow, "_try_sync_turnstile", return_value=True),
+            mock.patch.object(login_flow, "_prepare_login_turnstile"),
             mock.patch.object(login_flow, "_visible_login_error", return_value=""),
             mock.patch.object(login_flow, "active_page", return_value=active),
             mock.patch.object(login_flow, "_wait_for_login_sso", return_value="sso-value"),
@@ -227,7 +227,7 @@ class LoginFormTests(unittest.TestCase):
             mock.patch.object(login_flow, "_native_input_candidates", side_effect=inputs),
             mock.patch.object(login_flow, "_type_login_value", return_value=True),
             mock.patch.object(login_flow, "_click_submit", return_value=True) as click_submit,
-            mock.patch.object(login_flow, "_try_sync_turnstile", return_value=True),
+            mock.patch.object(login_flow, "_prepare_login_turnstile"),
             mock.patch.object(login_flow, "_visible_login_error", return_value=""),
             mock.patch.object(login_flow, "active_page", return_value=active),
             mock.patch.object(login_flow, "_wait_for_login_sso", return_value="sso-value"),
@@ -259,7 +259,7 @@ class LoginFormTests(unittest.TestCase):
             mock.patch.object(login_flow, "_type_login_value", return_value=True),
             mock.patch.object(login_flow, "_click_submit", return_value=True) as click_submit,
             mock.patch.object(login_flow, "_wait_until", return_value=True),
-            mock.patch.object(login_flow, "_try_sync_turnstile", return_value=True),
+            mock.patch.object(login_flow, "_prepare_login_turnstile"),
             mock.patch.object(login_flow, "_visible_login_error", return_value=""),
             mock.patch.object(login_flow, "active_page", return_value=active),
             mock.patch.object(login_flow, "_wait_for_login_sso", return_value="sso-value"),
@@ -318,6 +318,264 @@ class RevealEmailInputTests(unittest.TestCase):
 
         self.assertIn("邮箱输入框", str(ctx.exception))
         self.assertEqual(click.call_count, login_flow.EMAIL_STEP_ATTEMPTS)
+
+
+class LoginCredentialErrorTests(unittest.TestCase):
+    def test_wrong_password_phrase_is_credential_error(self):
+        self.assertTrue(login_flow.looks_like_invalid_credentials("Wrong email address or password."))
+        self.assertEqual(
+            login_flow.credential_error_from_texts(
+                "Log in with your email Email Password Wrong email address or password. Login"
+            ),
+            "Wrong email address or password.",
+        )
+        with self.assertRaises(login_flow.InvalidLoginCredentials) as ctx:
+            login_flow.raise_if_login_error("Wrong email address or password.")
+        self.assertIn("账号或密码错误", str(ctx.exception))
+        self.assertFalse(login_flow.looks_like_invalid_credentials("This service is not available in your region."))
+
+    def test_wrong_password_raises_before_waiting_for_sso(self):
+        email_input = mock.Mock()
+        password_input = mock.Mock()
+        active = mock.Mock(url="https://accounts.x.ai/sign-in")
+
+        def inputs(kind):
+            return [email_input] if kind == "email" else [password_input]
+
+        with (
+            mock.patch.object(login_flow, "_navigate_signin"),
+            mock.patch.object(login_flow, "_dismiss_cookie_consent"),
+            mock.patch.object(login_flow, "_native_input_candidates", side_effect=inputs),
+            mock.patch.object(login_flow, "_type_login_value", return_value=True),
+            mock.patch.object(login_flow, "_click_submit", return_value=True),
+            mock.patch.object(login_flow, "_prepare_login_turnstile"),
+            mock.patch.object(login_flow, "_try_sync_turnstile") as turnstile,
+            mock.patch.object(
+                login_flow,
+                "_visible_login_error",
+                return_value="Wrong email address or password.",
+            ),
+            mock.patch.object(login_flow, "active_page", return_value=active),
+            mock.patch.object(login_flow, "_read_sso_cookie", return_value=""),
+            mock.patch.object(login_flow, "_wait_for_login_sso") as wait_sso,
+            mock.patch.object(login_flow.time, "sleep"),
+        ):
+            with self.assertRaises(login_flow.InvalidLoginCredentials) as ctx:
+                login_flow.login_with_password("khumowldgn@outlook.com", "secret")
+
+        self.assertIn("Wrong email address or password", str(ctx.exception))
+        wait_sso.assert_not_called()
+        turnstile.assert_not_called()
+
+    def test_prepare_turnstile_skips_sync_when_widget_never_mounts(self):
+        logs = []
+        with (
+            mock.patch.object(login_flow, "_login_turnstile_solved", return_value=False),
+            mock.patch.object(login_flow, "_login_turnstile_mounted", return_value=False),
+            mock.patch.object(login_flow, "_wait_until", return_value=False),
+            mock.patch.object(login_flow, "_try_click_turnstile_frame") as click_frame,
+            mock.patch.object(login_flow, "_try_sync_turnstile") as turnstile,
+        ):
+            login_flow._prepare_login_turnstile(log_callback=logs.append)
+
+        click_frame.assert_called_once()
+        turnstile.assert_not_called()
+        self.assertTrue(any("未出现 Turnstile" in message for message in logs))
+
+    def test_prepare_turnstile_syncs_before_login_when_widget_mounted(self):
+        with (
+            mock.patch.object(login_flow, "_login_turnstile_solved", return_value=False),
+            mock.patch.object(login_flow, "_login_turnstile_mounted", return_value=True),
+            mock.patch.object(login_flow, "_try_sync_turnstile", return_value=True) as turnstile,
+        ):
+            login_flow._prepare_login_turnstile()
+
+        turnstile.assert_called_once()
+
+    def test_prepare_turnstile_raises_when_sync_fails(self):
+        with (
+            mock.patch.object(login_flow, "_login_turnstile_solved", return_value=False),
+            mock.patch.object(login_flow, "_login_turnstile_mounted", return_value=True),
+            mock.patch.object(login_flow, "_try_sync_turnstile", return_value=False),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "登录安全验证未通过"):
+                login_flow._prepare_login_turnstile()
+
+    def test_login_waits_for_turnstile_before_clicking_login(self):
+        email_input = mock.Mock()
+        password_input = mock.Mock()
+        active = mock.Mock(url="https://grok.com/")
+        calls = []
+
+        def inputs(kind):
+            return [email_input] if kind == "email" else [password_input]
+
+        def prepare(log_callback=None):
+            calls.append("prepare")
+
+        def click(keywords):
+            calls.append(("click", keywords[0]))
+            return True
+
+        with (
+            mock.patch.object(login_flow, "_navigate_signin"),
+            mock.patch.object(login_flow, "_dismiss_cookie_consent"),
+            mock.patch.object(login_flow, "_native_input_candidates", side_effect=inputs),
+            mock.patch.object(login_flow, "_type_login_value", return_value=True),
+            mock.patch.object(login_flow, "_prepare_login_turnstile", side_effect=prepare),
+            mock.patch.object(login_flow, "_click_submit", side_effect=click),
+            mock.patch.object(login_flow, "_visible_login_error", return_value=""),
+            mock.patch.object(login_flow, "active_page", return_value=active),
+            mock.patch.object(login_flow, "_read_sso_cookie", return_value="sso-value"),
+            mock.patch.object(login_flow.time, "sleep"),
+        ):
+            token = login_flow.login_with_password("fixture@example.com", "pw")
+
+        self.assertEqual(token, "sso-value")
+        self.assertEqual(calls[0], "prepare")
+        self.assertEqual(calls[1], ("click", "登录"))
+
+    def test_login_retries_turnstile_click_when_still_on_signin(self):
+        email_input = mock.Mock()
+        password_input = mock.Mock()
+        active = mock.Mock(url="https://accounts.x.ai/sign-in")
+
+        def inputs(kind):
+            return [email_input] if kind == "email" else [password_input]
+
+        with (
+            mock.patch.object(login_flow, "_navigate_signin"),
+            mock.patch.object(login_flow, "_dismiss_cookie_consent"),
+            mock.patch.object(login_flow, "_native_input_candidates", side_effect=inputs),
+            mock.patch.object(login_flow, "_type_login_value", return_value=True),
+            mock.patch.object(login_flow, "_prepare_login_turnstile"),
+            mock.patch.object(login_flow, "_click_submit", return_value=True) as click_submit,
+            mock.patch.object(login_flow, "_login_turnstile_needs_resubmit", return_value=True),
+            mock.patch.object(login_flow, "_recover_login_turnstile") as recover,
+            mock.patch.object(login_flow, "_visible_login_error", return_value=""),
+            mock.patch.object(login_flow, "active_page", return_value=active),
+            mock.patch.object(login_flow, "_read_sso_cookie", return_value=""),
+            mock.patch.object(login_flow, "_wait_for_login_sso", return_value="sso-value") as wait_sso,
+            mock.patch.object(login_flow, "POST_SUBMIT_ERROR_WINDOW", 0),
+            mock.patch.object(login_flow.time, "sleep"),
+        ):
+            token = login_flow.login_with_password("fixture@example.com", "pw")
+
+        self.assertEqual(token, "sso-value")
+        recover.assert_called()
+        self.assertFalse(recover.call_args.kwargs.get("full_sync"))
+        wait_sso.assert_called_once()
+        self.assertTrue(wait_sso.call_args.kwargs.get("turnstile_retried"))
+        click_submit.assert_called_once()
+
+    def test_sso_wait_retries_turnstile_clicks_while_stuck(self):
+        cookies = iter(["", "", "", "sso-value"])
+        with (
+            mock.patch.object(login_flow, "_read_sso_cookie", side_effect=lambda: next(cookies)),
+            mock.patch.object(login_flow, "_visible_login_error", return_value=""),
+            mock.patch.object(login_flow, "_still_on_signin", return_value=True),
+            mock.patch.object(login_flow, "_should_retry_cf", return_value=True),
+            mock.patch.object(login_flow, "_recover_login_turnstile") as recover,
+            mock.patch.object(login_flow.time, "sleep"),
+        ):
+            token = login_flow._wait_for_login_sso(timeout=30)
+
+        self.assertEqual(token, "sso-value")
+        self.assertGreaterEqual(recover.call_count, 2)
+        self.assertTrue(any(call.kwargs.get("full_sync") for call in recover.call_args_list))
+
+    def test_recover_clicks_turnstile_then_submits_when_solved(self):
+        with (
+            mock.patch.object(login_flow, "_still_on_signin", return_value=True),
+            mock.patch.object(login_flow, "_login_turnstile_solved", side_effect=[False, True]),
+            mock.patch.object(login_flow, "_try_click_turnstile_frame") as click_frame,
+            mock.patch.object(login_flow, "_try_sync_turnstile") as sync,
+            mock.patch.object(login_flow, "_click_submit") as submit,
+        ):
+            login_flow._recover_login_turnstile(full_sync=False)
+
+        click_frame.assert_called_once()
+        sync.assert_not_called()
+        submit.assert_called_once()
+
+    def test_recover_full_sync_retries_turnstile_then_login(self):
+        with (
+            mock.patch.object(login_flow, "_still_on_signin", return_value=True),
+            mock.patch.object(login_flow, "_login_turnstile_solved", return_value=False),
+            mock.patch.object(login_flow, "_try_click_turnstile_frame") as click_frame,
+            mock.patch.object(login_flow, "_try_sync_turnstile", return_value=True) as sync,
+            mock.patch.object(login_flow, "_click_submit") as submit,
+        ):
+            login_flow._recover_login_turnstile(full_sync=True)
+
+        click_frame.assert_called_once()
+        sync.assert_called_once()
+        submit.assert_called_once()
+
+    def test_turnstile_mounted_js_does_not_require_visible_box(self):
+        page_obj = mock.Mock()
+        page_obj.run_js.return_value = True
+        with mock.patch.object(login_flow, "page", page_obj):
+            self.assertTrue(login_flow._login_turnstile_mounted())
+        script = page_obj.run_js.call_args[0][0]
+        self.assertIn("cf-turnstile-response", script)
+        self.assertIn('script[src*="turnstile"]', script)
+        self.assertNotIn("rect.width > 8", script)
+
+    def test_sso_wait_raises_invalid_credentials_instead_of_timeout(self):
+        with (
+            mock.patch.object(login_flow, "_read_sso_cookie", return_value=""),
+            mock.patch.object(
+                login_flow,
+                "_visible_login_error",
+                return_value="Wrong email address or password.",
+            ),
+            mock.patch.object(login_flow.time, "sleep"),
+        ):
+            with self.assertRaises(login_flow.InvalidLoginCredentials):
+                login_flow._wait_for_login_sso(timeout=30)
+
+    def test_classify_failure_maps_credential_error_before_sso_timeout(self):
+        from backend.registration import engine
+
+        exc = login_flow.InvalidLoginCredentials("账号或密码错误: Wrong email address or password.")
+        self.assertEqual(engine.classify_failure(exc), engine.FAIL_INVALID_CREDENTIALS)
+        self.assertEqual(
+            engine.classify_failure(RuntimeError("Wrong email address or password.")),
+            engine.FAIL_INVALID_CREDENTIALS,
+        )
+
+    def test_login_logs_low_traffic_mode(self):
+        logs = []
+        email_input = mock.Mock()
+        password_input = mock.Mock()
+        active = mock.Mock(url="https://grok.com/")
+
+        def inputs(kind):
+            return [email_input] if kind == "email" else [password_input]
+
+        with (
+            mock.patch.object(login_flow, "_navigate_signin"),
+            mock.patch.object(login_flow, "_dismiss_cookie_consent"),
+            mock.patch.object(login_flow, "_native_input_candidates", side_effect=inputs),
+            mock.patch.object(login_flow, "_type_login_value", return_value=True),
+            mock.patch.object(login_flow, "_click_submit", return_value=True),
+            mock.patch.object(login_flow, "_prepare_login_turnstile"),
+            mock.patch.object(login_flow, "_visible_login_error", return_value=""),
+            mock.patch.object(login_flow, "active_page", return_value=active),
+            mock.patch.object(login_flow, "_read_sso_cookie", return_value="sso-value"),
+            mock.patch.object(login_flow, "low_traffic_enabled", return_value=True),
+            mock.patch.object(login_flow, "traffic_savings_level", return_value="more"),
+            mock.patch.object(login_flow.time, "sleep"),
+        ):
+            token = login_flow.login_with_password(
+                "fixture@example.com",
+                "pw",
+                log_callback=logs.append,
+            )
+
+        self.assertEqual(token, "sso-value")
+        self.assertTrue(any("低流量模式" in message and "更多节省" in message for message in logs))
 
 
 if __name__ == "__main__":

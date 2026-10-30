@@ -23,7 +23,7 @@ LATEST_RELEASE_API = (
 RELEASE_TAG_URL = "https://github.com/kaibush/grok-register/releases/tag/"
 MAX_RELEASE_BYTES = 1 << 20
 MAX_NOTES_CHARS = 4096
-DEFAULT_CHECK_INTERVAL_SECONDS = 60 * 60
+DEFAULT_CHECK_INTERVAL_SECONDS = 15 * 60
 
 STATUS_UNCHECKED = "unchecked"
 STATUS_UP_TO_DATE = "up_to_date"

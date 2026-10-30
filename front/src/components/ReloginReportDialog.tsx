@@ -18,12 +18,12 @@ function itemLabel(item: ReloginItem) {
 
 export function reloginSsoCheckLabel(item: ReloginItem) {
   const source = item.bot_flag_source;
-  if (item.sso_check_status === "clean") return "SSO 风控正常（botFlagSource=0）";
+  if (item.sso_check_status === "clean") return "历史 SSO 检查：正常";
   if (item.sso_check_status === "flagged") {
-    return `SSO 风控异常（botFlagSource=${source ?? "-"}）`;
+    return `历史 SSO 检查：异常（botFlagSource=${source ?? "-"}）`;
   }
-  if (item.sso_check_status === "unknown") return "SSO 风控结论未知";
-  if (item.sso_check_status === "failed") return "SSO 风控检查失败";
+  if (item.sso_check_status === "unknown") return "历史 SSO 检查：结论未知";
+  if (item.sso_check_status === "failed") return "历史 SSO 检查失败";
   return "";
 }
 
@@ -52,6 +52,7 @@ export function buildReloginReportText(report: ReloginReportLike) {
       riskLabel ? `  ${riskLabel}` : "",
       item.sso_check_error ? `  检查说明：${item.sso_check_error}` : "",
       item.stage ? `  阶段：${item.stage}` : "",
+      item.failure_type === "invalid_credentials" ? "  结论：账号或密码错误，不是 SSO 异常" : "",
       item.error_type ? `  异常类型：${item.error_type}` : "",
       item.visible_error && item.visible_error !== item.error ? `  页面错误：${item.visible_error}` : "",
       item.url ? `  页面地址：${item.url}` : "",

@@ -345,6 +345,9 @@ class CamoufoxPage:
 
     # ── 导航 ──
     def get(self, url: str, **kw):
+        # 完整 load 会被慢代理和第三方资源拖住；注册/登录控件只依赖 DOM。
+        kw.setdefault("wait_until", "domcontentloaded")
+        kw.setdefault("timeout", 45_000)
         self._page.goto(url, **kw)
 
     def back(self):

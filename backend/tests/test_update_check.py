@@ -20,8 +20,8 @@ from backend.web.update_check import (
 
 
 class ReleaseUpdateServiceTests(unittest.TestCase):
-    def test_default_check_interval_is_one_hour(self):
-        self.assertEqual(DEFAULT_CHECK_INTERVAL_SECONDS, 60 * 60)
+    def test_default_check_interval_is_fifteen_minutes(self):
+        self.assertEqual(DEFAULT_CHECK_INTERVAL_SECONDS, 15 * 60)
 
     def test_check_finds_new_github_release(self):
         captured = {}

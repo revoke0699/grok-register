@@ -14,9 +14,8 @@ ENV PATH=/opt/venv/bin:$PATH \
     PIP_NO_CACHE_DIR=1 \
     XDG_CACHE_HOME=/opt/camoufox-cache
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates python3 python3-pip python3-venv \
-    && rm -rf /var/lib/apt/lists/*
+COPY --chmod=755 docker/apt-retry.sh /usr/local/bin/apt-retry.sh
+RUN apt-retry.sh ca-certificates python3 python3-pip python3-venv
 
 WORKDIR /build
 COPY requirements.txt ./
@@ -48,7 +47,8 @@ ENV PATH=/opt/venv/bin:$PATH \
     GROK_FORCE_HEADED=1
 
 # Camoufox/Firefox 与 CloakBrowser/Chromium 有头模式依赖 + Xvfb 虚拟显示器。
-RUN apt-get update && apt-get install -y --no-install-recommends \
+COPY --chmod=755 docker/apt-retry.sh /usr/local/bin/apt-retry.sh
+RUN apt-retry.sh \
         ca-certificates dumb-init gosu procps python3 xvfb xauth \
         libasound2t64 libatk1.0-0t64 libavcodec60 \
         libatk-bridge2.0-0t64 libatspi2.0-0t64 libcups2t64 \
@@ -62,8 +62,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libnspr4 libnss3 fonts-freefont-ttf fonts-liberation \
         fonts-noto-color-emoji fonts-unifont fonts-wqy-zenhei \
     && groupadd --gid "$APP_GID" app \
-    && useradd --uid "$APP_UID" --gid "$APP_GID" --create-home --shell /bin/bash app \
-    && rm -rf /var/lib/apt/lists/*
+    && useradd --uid "$APP_UID" --gid "$APP_GID" --create-home --shell /bin/bash app
 
 WORKDIR /app
 COPY --chown=app:app --from=python-builder /opt/venv /opt/venv

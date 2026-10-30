@@ -3,6 +3,7 @@ import { Link, useSearchParams } from "react-router-dom";
 import {
   ArrowRight,
   Cloud,
+  Database,
   Eye,
   EyeOff,
   HelpCircle,
@@ -11,9 +12,10 @@ import {
   Save,
   Settings2,
   ShieldCheck,
+  Trash2,
   Webhook,
 } from "lucide-react";
-import { api, type OutlookEmailGroup } from "@/lib/api";
+import { api, type BrowserCacheSnapshot, type OutlookEmailGroup } from "@/lib/api";
 import {
   Button,
   buttonVariants,
@@ -61,6 +63,11 @@ const PROVIDERS = [
     label: "CloudMail 自建邮箱",
     description: "适合自建 cloud-mail，需要站点地址、管理员账号和域名。",
   },
+  {
+    value: "icloud",
+    label: "iCloud 邮箱（Veilimage）",
+    description: "使用事先配置好的 iCloud 邮箱，通过 Veilimage 取验证码，不是现场生成邮箱。",
+  },
 ];
 // cpa / grok2api 保留类型仅为兼容；路由已重定向到 tokenauth
 export type SettingsSection = "registration" | "tokenauth" | "cpa" | "grok2api" | "mail" | "outlook";
@@ -101,6 +108,32 @@ const CLOUDFLARE_AUTH_MODES = [
   { value: "query-key", label: "URL 参数 key" },
 ];
 
+function formatCacheBytes(value: number) {
+  const size = Math.max(0, Number(value) || 0);
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function cacheScopeLabel(scope: string) {
+  if (scope === "standard") return "较少节省";
+  if (scope === "more") return "更多节省";
+  return "未分类";
+}
+
+function cacheRiskLabel(level: string | undefined) {
+  if (level === "high") return "高风险";
+  if (level === "medium") return "中风险";
+  if (level === "low") return "低风险";
+  return "未检测";
+}
+
+function cacheRiskClass(level: string | undefined) {
+  if (level === "high") return "text-red-700";
+  if (level === "medium") return "text-amber-700";
+  return "text-slate-500";
+}
+
 function ToggleRow({
   title,
   description,
@@ -121,6 +154,128 @@ function ToggleRow({
         {description ? <div className="mt-0.5 text-xs leading-5 text-muted-foreground">{description}</div> : null}
       </div>
       <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} label={title} />
+    </div>
+  );
+}
+
+function cacheEntryActive(entry: { scope: string; active?: boolean; replay_safe?: boolean }, config: Record<string, any>) {
+  if (!config.browser_low_traffic_mode) return false;
+  if (entry.replay_safe === false) return false;
+  if (typeof entry.active === "boolean") return entry.active;
+  if (entry.scope === "standard") return true;
+  if (entry.scope === "more") return config.browser_traffic_savings_level !== "standard";
+  return false;
+}
+
+function LowTrafficCachePanel({
+  config,
+  snapshot,
+  loading,
+  clearing,
+  onRefresh,
+  onClear,
+}: {
+  config: Record<string, any>;
+  snapshot: BrowserCacheSnapshot | null;
+  loading: boolean;
+  clearing: boolean;
+  onRefresh: () => void;
+  onClear: () => void;
+}) {
+  const entries = snapshot?.entries || [];
+  const activeEntries = entries.filter((item) => cacheEntryActive(item, config));
+  const activeBytes = activeEntries.reduce((sum, item) => sum + (item.size || 0), 0);
+  const highRiskEntries = entries.filter((item) => item.risk_level === "high");
+  const highRiskBytes = highRiskEntries.reduce((sum, item) => sum + (item.size || 0), 0);
+  const currentLevel = config.browser_low_traffic_mode
+    ? config.browser_traffic_savings_level === "standard"
+      ? "较少节省"
+      : "更多节省"
+    : "未开启";
+  return (
+    <div className="space-y-3 rounded-xl border bg-muted/35 px-3 py-3 sm:px-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+            <Database className="h-4 w-4" aria-hidden="true" />
+            静态资源缓存
+          </div>
+          <p className="mt-0.5 text-xs leading-5 text-muted-foreground">
+            清空后下次打开注册页或重新登录页会按当前省流级别自动重新下载并写入。较少节省只生效 grok.com CDN。更多节省会扫描 accounts.x.ai 缓存内容：Castle / Mixpanel / Turnstile / 性能埋点等高风险 JS 即使已缓存也不会回放。
+          </p>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          <Button variant="outline" size="sm" onClick={onRefresh} disabled={loading || clearing}>
+            <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
+            刷新
+          </Button>
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={onClear}
+            disabled={loading || clearing || !snapshot?.entry_count}
+          >
+            <Trash2 className="h-4 w-4" />
+            {clearing ? "清空中" : "清空缓存"}
+          </Button>
+        </div>
+      </div>
+      <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-4">
+        <div>当前模式：<span className="font-medium text-foreground">{currentLevel}</span></div>
+        <div>磁盘缓存：<span className="font-medium text-foreground">{snapshot ? `${snapshot.entry_count} 个 / ${formatCacheBytes(snapshot.total_bytes)}` : (loading ? "读取中…" : "未读取")}</span></div>
+        <div>当前生效：<span className="font-medium text-foreground">{snapshot ? `${activeEntries.length} 个 / ${formatCacheBytes(activeBytes)}` : "—"}</span></div>
+        <div>风险文件：<span className="font-medium text-foreground">{snapshot ? `高 ${snapshot.high_risk_count || 0} / 中 ${snapshot.medium_risk_count || 0}` : "—"}</span></div>
+      </div>
+      {highRiskEntries.length ? (
+        <p className="text-xs leading-5 text-amber-700">
+          已识别 {highRiskEntries.length} 个高风险缓存文件（{formatCacheBytes(highRiskBytes)}）。更多节省下这些文件会保留在磁盘供核对，但注册/重登不会回放，改为实时下载。
+        </p>
+      ) : null}
+      {entries.length ? (
+        <div className="max-h-64 overflow-auto rounded-lg border bg-white">
+          <table className="w-full text-left text-xs">
+            <thead className="sticky top-0 bg-slate-50 text-slate-500">
+              <tr>
+                <th className="px-3 py-2 font-medium">状态</th>
+                <th className="px-3 py-2 font-medium">资源</th>
+                <th className="px-3 py-2 font-medium">风险</th>
+                <th className="px-3 py-2 font-medium">级别</th>
+                <th className="px-3 py-2 font-medium text-right">大小</th>
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((item) => {
+                const active = cacheEntryActive(item, config);
+                const name = (item.path || "").split("/").filter(Boolean).pop() || item.url || item.id;
+                const reasons = (item.risk_reasons || []).join("；");
+                return (
+                  <tr key={item.id} className="border-t border-slate-100">
+                    <td className="px-3 py-2">
+                      <span className={active ? "text-emerald-700" : "text-slate-400"}>
+                        {active ? "生效" : (item.replay_safe === false ? "跳过回放" : "未启用")}
+                      </span>
+                    </td>
+                    <td className="max-w-[18rem] px-3 py-2">
+                      <div className="truncate font-medium text-foreground" title={item.url || item.id}>{name}</div>
+                      <div className="truncate text-[11px] text-slate-400" title={item.url}>{item.host || "未知来源"}</div>
+                    </td>
+                    <td className="max-w-[14rem] px-3 py-2">
+                      <div className={`font-medium ${cacheRiskClass(item.risk_level)}`}>{cacheRiskLabel(item.risk_level)}</div>
+                      {reasons ? <div className="truncate text-[11px] text-slate-400" title={reasons}>{reasons}</div> : null}
+                    </td>
+                    <td className="px-3 py-2 text-slate-500">{cacheScopeLabel(item.scope)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums text-slate-600">{formatCacheBytes(item.size)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">
+          {loading ? "正在读取缓存…" : "还没有缓存文件。开启低流量模式后，首次打开注册页或重新登录页会自动下载并保存。"}
+        </p>
+      )}
     </div>
   );
 }
@@ -344,6 +499,9 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
   const [outlookGroups, setOutlookGroups] = useState<OutlookEmailGroup[]>([]);
   const [outlookGroupsLoading, setOutlookGroupsLoading] = useState(false);
   const [outlookGroupsError, setOutlookGroupsError] = useState("");
+  const [cacheSnapshot, setCacheSnapshot] = useState<BrowserCacheSnapshot | null>(null);
+  const [cacheLoading, setCacheLoading] = useState(false);
+  const [cacheClearing, setCacheClearing] = useState(false);
 
   const showToast = (message: string, tone: "default" | "success" | "error" = "default") => {
     setToast({ message, tone });
@@ -388,6 +546,37 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
     }
   }, [section]);
 
+  const loadBrowserCache = async () => {
+    setCacheLoading(true);
+    try {
+      const data = await api.browserCache();
+      setCacheSnapshot(data);
+    } catch (err: any) {
+      showToast(err.message || "读取缓存失败", "error");
+    } finally {
+      setCacheLoading(false);
+    }
+  };
+
+  const clearBrowserCache = async () => {
+    if (!window.confirm("清空本地静态资源缓存？下次打开注册页或重新登录页会按当前省流级别重新下载。")) {
+      return;
+    }
+    setCacheClearing(true);
+    try {
+      const data = await api.clearBrowserCache();
+      setCacheSnapshot(data);
+      showToast(
+        data.deleted_files ? `已清空 ${data.deleted_files} 个缓存文件` : "缓存已清空",
+        "success",
+      );
+    } catch (err: any) {
+      showToast(err.message || "清空缓存失败", "error");
+    } finally {
+      setCacheClearing(false);
+    }
+  };
+
   const setField = (key: string, value: any) => {
     setConfig((previous) => ({ ...previous, [key]: value }));
   };
@@ -418,6 +607,12 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
   );
   const [generalTab, setGeneralTab] = useState<"task" | "browser" | "behavior">("task");
   const [authTab, setAuthTab] = useState<"conversion" | "cpa" | "grok2api" | "sub2api">("conversion");
+
+  useEffect(() => {
+    if (isRegistrationWorkspace && registrationTab === "general" && generalTab === "behavior") {
+      void loadBrowserCache();
+    }
+  }, [section, registrationTab, generalTab]);
   const meta = isRegistrationWorkspace ? SECTION_META.registration : SECTION_META[section];
 
   const selectRegistrationTab = (tab: "general" | "tokenauth") => {
@@ -615,20 +810,40 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 onCheckedChange={(value) => setField("browser_headless", value)}
               />
               <ToggleRow
-                title="低流量注册模式"
+                title="低流量模式"
+                description="注册和重新登录共用静态资源缓存，并跳过非必需媒体。默认较少节省只缓存 grok.com CDN；更多节省会缓存 accounts.x.ai 哈希资源，但自动跳过 Castle / Mixpanel / Turnstile 等高风险 JS 回放"
                 checked={!!config.browser_low_traffic_mode}
                 onCheckedChange={(value) => setField("browser_low_traffic_mode", value)}
               />
               {config.browser_low_traffic_mode ? (
-                <Select
-                  id="browser_traffic_savings_level"
-                  value={config.browser_traffic_savings_level === "standard" ? "standard" : "more"}
-                  onChange={(event) => setField("browser_traffic_savings_level", event.target.value)}
-                >
-                  <option value="standard">较少节省</option>
-                  <option value="more">更多节省</option>
-                </Select>
+                <div className="min-w-0 space-y-2">
+                  <Label htmlFor="browser_traffic_savings_level">省流级别</Label>
+                  <Select
+                    id="browser_traffic_savings_level"
+                    value={config.browser_traffic_savings_level === "standard" ? "standard" : "more"}
+                    onChange={(event) => setField("browser_traffic_savings_level", event.target.value)}
+                  >
+                    <option value="standard">较少节省（推荐，账号质量更稳）</option>
+                    <option value="more">更多节省（可能提高降智率）</option>
+                  </Select>
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    较少节省只缓存 grok.com CDN。更多节省会扫描已缓存的 accounts.x.ai JS：指纹 SDK、分析埋点和 Turnstile 相关文件会标成高风险并跳过回放。
+                  </p>
+                  {config.browser_traffic_savings_level !== "standard" ? (
+                    <p className="text-xs leading-5 text-amber-700">
+                      当前为更多节省：高风险 JS 已改为实时下载，但其余 accounts 哈希资源仍可能影响账号质量。追求质量请改用较少节省。
+                    </p>
+                  ) : null}
+                </div>
               ) : null}
+              <LowTrafficCachePanel
+                config={config}
+                snapshot={cacheSnapshot}
+                loading={cacheLoading}
+                clearing={cacheClearing}
+                onRefresh={() => void loadBrowserCache()}
+                onClear={() => void clearBrowserCache()}
+              />
               <ToggleRow
                 title="停止时关闭浏览器"
                 description="收到停止请求后清理当前浏览器实例"
@@ -971,6 +1186,28 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
                 <ConfigField {...fieldState} label="管理员邮箱" field="cloudmail_admin_email" />
                 <ConfigField {...fieldState} label="管理员密码" field="cloudmail_password" type="password" />
                 <ConfigField {...fieldState} label="收信域名" field="defaultDomains" helper="多个域名可用逗号或空格分隔" />
+              </>
+            ) : null}
+
+            {selectedProvider.value === "icloud" ? (
+              <>
+                <ConfigField {...fieldState} label="接口地址" field="icloud_api_base" helper="Veilimage 取码接口根地址，默认 https://mail.veilimage.com" />
+                <ConfigField {...fieldState} label="iCloud 邮箱" field="icloud_email" helper="单个已配置的 iCloud 邮箱。填写了下方邮箱列表时，注册会优先轮询列表" />
+                <ConfigField
+                  {...fieldState}
+                  label="code_key"
+                  field="icloud_code_key"
+                  type="password"
+                  helper="Veilimage 取码链接里 ?key= 后面的整串。形如 mail_<urlencoded邮箱>_<十六进制后缀>。如果只填了十六进制后缀，会按当前邮箱补成整串"
+                />
+                <ConfigField {...fieldState} label="多个 iCloud 邮箱" field="icloud_emails" helper="可选，逗号分隔多个已配置邮箱，注册时按顺序轮流使用" />
+                <ConfigField
+                  {...fieldState}
+                  label="多个 code_key"
+                  field="icloud_code_keys"
+                  type="password"
+                  helper="可选，逗号分隔，与上面的邮箱按顺序一一对应。每项都是 ?key= 后面的整串；只填十六进制后缀时按对应邮箱补全"
+                />
               </>
             ) : null}
 

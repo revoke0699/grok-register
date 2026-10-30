@@ -33,6 +33,7 @@ function enrichReloginItem(item: ReloginItem, account?: AccountRecord): ReloginI
     error: item.error || String(extra.relogin_error || ""),
     stage: item.stage || value("stage"),
     error_type: item.error_type || value("error_type"),
+    failure_type: item.failure_type || value("failure_type") || (String(extra.relogin_error || "").includes("账号或密码错误") ? "invalid_credentials" : ""),
     url: item.url || value("url"),
     page_title: item.page_title || value("page_title"),
     visible_error: item.visible_error || value("visible_error"),
@@ -175,12 +176,15 @@ export function ReloginHistoryPage() {
                         <div className="break-all text-sm font-medium text-slate-900">{detailItem.email || `账号 #${detailItem.account_id}`}</div>
                         <div className={`mt-1 break-all text-xs ${detailItem.status === "failed" ? "text-red-700" : "text-slate-500"}`}>
                           {detailItem.status === "failed"
-                            ? detailItem.error || "未知错误"
+                            ? (detailItem.failure_type === "invalid_credentials"
+                              ? "账号或密码错误，不是 SSO 异常"
+                              : detailItem.error || "未知错误")
                             : reloginSsoCheckLabel(detailItem) || "重新登录成功"}
                         </div>
                         {detailItem.status === "failed" && (detailItem.stage || detailItem.error_type || detailItem.url || detailItem.visible_error) ? (
                           <div className="mt-3 grid gap-2 rounded-lg border border-red-100 bg-red-50/50 p-3 text-xs sm:grid-cols-2">
                             {detailItem.stage ? <div><span className="text-slate-500">失败阶段</span><div className="mt-0.5 font-medium text-slate-800">{detailItem.stage}</div></div> : null}
+                            {detailItem.failure_type === "invalid_credentials" ? <div><span className="text-slate-500">结论</span><div className="mt-0.5 text-red-700">账号或密码错误，不是 SSO 异常</div></div> : null}
                             {detailItem.error_type ? <div><span className="text-slate-500">异常类型</span><div className="mt-0.5 font-mono text-slate-800">{detailItem.error_type}</div></div> : null}
                             {detailItem.visible_error && detailItem.visible_error !== detailItem.error ? <div className="sm:col-span-2"><span className="text-slate-500">页面错误</span><div className="mt-0.5 break-words text-red-700">{detailItem.visible_error}</div></div> : null}
                             {detailItem.url ? <div className="sm:col-span-2"><span className="text-slate-500">失败页面</span><div className="mt-0.5 break-all font-mono text-slate-700">{detailItem.url}</div></div> : null}

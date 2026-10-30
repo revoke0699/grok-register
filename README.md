@@ -23,7 +23,8 @@
 
 - Web 控制台：任务进度、实时日志、账号管理和系统设置
 - Camoufox（Firefox，默认）与 CloakBrowser（Chromium）双浏览器后端，共用注册流程、代理和异常进程清理
-- 支持 Cloudflare、DuckMail / Mail.tm、YYDS、MailNest、OutlookEmail、CloudMail
+- 支持 Cloudflare、DuckMail / Mail.tm、YYDS、MailNest、OutlookEmail、CloudMail、iCloud
+- iCloud 使用事先在 Veilimage 配好的邮箱，不现场生成。取码为 `GET {icloud_api_base}/api/v1/code?key={code_key}`，`icloud_api_base` 默认 `https://mail.veilimage.com`。`code_key` 填写取码链接里 `?key=` 后面的整串，形如 `mail_`、URL 编码后的邮箱、`_` 和十六进制后缀。配置里如果只写了十六进制后缀，会按当前邮箱补成整串。多个邮箱和多个 code_key 用逗号分隔，并按顺序一一对应
 - 注册完成后生成 CPA / Grok2API JSON
 - 上游已不再下发 `bfs`，本项目不能判断账号是否风控；必须联动 [GrokIQ](https://github.com/kaibush/grok-iq) 做账号级降智检测和自动隔离
 - Grok Build 导入成功后通过持久 Webhook 通知 GrokIQ，由 GrokIQ 自动探针并隔离异常账号
@@ -224,8 +225,8 @@ Windows 启动：
 | `proxy` | 注册和 OAuth 请求使用的 HTTP(S) 代理；支持 `http://host:port` 和 `http://user:password@host:port`，凭据中的特殊字符需使用 URL 百分号编码。注册风控会记录浏览器识别到的出口 IP；下次若仍是该 IP，会重启浏览器换出口后再注册。风控名单在「账号中心 → 出口 IP 风控」查看，单账号出口 IP 在「账号中心 → 账号管理 → 查看」详情中 |
 | `browser_engine` | 浏览器后端：`camoufox`（默认）或 `cloakbrowser` |
 | `browser_headless` | 本机无头模式；Docker 中强制关闭 |
-| `browser_low_traffic_mode` | 低流量注册模式，默认开启；复用静态资源缓存并跳过非注册必需资源 |
-| `browser_traffic_savings_level` | 低流量模式下的节省级别，默认 `more`（额外缓存 accounts.x.ai 哈希静态资源）；`standard` 仅缓存 grok.com CDN |
+| `browser_low_traffic_mode` | 低流量模式，默认开启；注册和重新登录共用静态资源缓存并跳过非必需资源。设置页可查看当前缓存并一键清空；清空后下次打开注册页或重新登录页会自动重新下载 |
+| `browser_traffic_savings_level` | 低流量模式下的节省级别，默认 `standard`（较少节省，仅缓存 grok.com CDN，账号质量更稳）；`more` 额外缓存 accounts.x.ai 哈希静态资源，但会扫描缓存内容并跳过 Castle / Mixpanel / Turnstile / 性能埋点等高风险 JS 回放。设置页会标出每个缓存文件的风险原因 |
 | `cpa_auto_add` | 注册后生成 CPA 授权 |
 | `sso_detailed_risk_check` | 获取 SSO 后尝试读取账号页 `botFlagSource`。上游已不再稳定下发 `bfs` / `botFlag`，该检查不能作为风控结论；账号级降智检测请用 GrokIQ |
 | `cpa_registration_risk_check` | 注册获取 SSO 后复查 grok.com `botFlag`；默认关闭。字段经常缺失，不能判断账号是否风控；必须使用 GrokIQ 做降智检测和自动隔离 |
@@ -294,7 +295,7 @@ cd front && npm run build
 ## 新版本检测
 
 服务启动后会读取根目录 `VERSION`，立即查询一次 GitHub Releases，之后每
-1 小时复查。发现高于当前版本的正式 Release 时，管理控制台会自动弹出更新提示，
+15 分钟复查。发现高于当前版本的正式 Release 时，管理控制台会自动弹出更新提示，
 展示版本号、Markdown 更新说明和 Release 链接；关闭后同一版本不再重复弹出，更高版本
 发布后会重新提示。Release 正文按 GitHub Markdown 渲染，标题、列表、链接和代码块会显示在弹窗里。
 

@@ -29,6 +29,8 @@ from backend.automation.session import (
 )
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
+SIGNUP_NAVIGATION_ATTEMPTS = 3
+SIGNUP_NAVIGATION_TIMEOUT_MS = 45_000
 
 
 class AccountAlreadyRegistered(Exception):
@@ -423,58 +425,180 @@ def _prepare_exit_ip(log_callback=None):
         prepare(log_callback)
 
 
+def _signup_page_state(page_obj) -> dict:
+    """判断注册页是否已可用，或被当前出口地区拦截。"""
+    state = {
+        "url": "",
+        "ready": False,
+        "region_blocked": False,
+        "text": "",
+        "email_form": False,
+        "signup_action": False,
+    }
+    try:
+        value = page_obj.run_js(
+            r"""
+const visible = (node) => {
+  if (!node) return false;
+  const style = getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden'
+    && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+};
+const text = String(document.body && document.body.innerText || '')
+  .replace(/\s+/g, ' ').trim().slice(0, 1200);
+const controls = [...document.querySelectorAll('button,a,[role="button"],input')]
+  .filter(visible)
+  .map((node) => String(
+    node.innerText || node.textContent || node.getAttribute('aria-label')
+    || node.placeholder || node.type || ''
+  ))
+  .join(' ').toLowerCase();
+const hasEmailInput = [...document.querySelectorAll('input')].some((node) => {
+  if (!visible(node)) return false;
+  const meta = [
+    node.type, node.name, node.autocomplete, node.placeholder, node.getAttribute('data-testid'),
+  ].filter(Boolean).join(' ').toLowerCase();
+  return meta.includes('email') || node.type === 'email';
+});
+const hasSignupAction = /sign.?up with email|continue with email|signup with email|使用邮箱注册|regístrate con correo|mit e-mail registrieren|メールで登録/.test(controls);
+return {
+  url: String(location.href || ''),
+  text,
+  ready: hasEmailInput || hasSignupAction,
+  email_form: hasEmailInput,
+  signup_action: hasSignupAction,
+};
+"""
+        )
+        if isinstance(value, dict):
+            state["url"] = str(value.get("url") or "")
+            state["text"] = str(value.get("text") or "")
+            state["ready"] = bool(value.get("ready"))
+            state["email_form"] = bool(value.get("email_form"))
+            state["signup_action"] = bool(value.get("signup_action"))
+    except Exception:
+        state["url"] = str(getattr(page_obj, "url", "") or "")
+    lower_text = state["text"].lower()
+    state["region_blocked"] = "service is not available in your region" in lower_text
+    return state
+
+
+def _wait_for_signup_page(page_obj, timeout: float = 12, cancel_callback=None) -> dict:
+    deadline = time.time() + max(float(timeout or 0), 0)
+    state = _signup_page_state(page_obj)
+    while not state["ready"] and not state["region_blocked"] and time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        sleep_with_cancel(0.25, cancel_callback)
+        state = _signup_page_state(page_obj)
+    return state
+
+
+def _active_or_new_signup_page(log_callback=None, cancel_callback=None, *, restart: bool = False):
+    if restart:
+        restart_browser(log_callback=log_callback, cancel_callback=cancel_callback)
+    elif active_browser() is None:
+        start_browser(log_callback=log_callback, cancel_callback=cancel_callback)
+        if log_callback:
+            log_callback("[*] 浏览器已启动")
+    _prepare_exit_ip(log_callback)
+    browser_obj = active_browser()
+    if browser_obj is None:
+        raise Exception("浏览器启动失败")
+    try:
+        tabs = browser_obj.get_tabs() if browser_obj is not None else []
+        page_obj = tabs[-1] if tabs else browser_obj.new_tab()
+    except Exception:
+        page_obj = browser_obj.new_tab()
+    set_browser_session(browser_obj, page_obj)
+    return page_obj
+
+
 def open_signup_page(log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
+    last_error = ""
+    for attempt in range(1, SIGNUP_NAVIGATION_ATTEMPTS + 1):
+        raise_if_cancelled(cancel_callback)
+        page_obj = _active_or_new_signup_page(
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            restart=attempt > 1,
+        )
+        navigation_error = ""
+        try:
+            # 完整 load 会被慢代理或第三方资源拖住；注册控件只依赖 DOM 就绪。
+            page_obj.get(
+                SIGNUP_URL,
+                wait_until="domcontentloaded",
+                timeout=SIGNUP_NAVIGATION_TIMEOUT_MS,
+            )
+        except Exception as exc:
+            navigation_error = f"{type(exc).__name__}: {exc}"
 
-    def _ensure_browser():
-        if active_browser() is None:
-            start_browser(log_callback=log_callback, cancel_callback=cancel_callback)
+        state = _signup_page_state(page_obj)
+        current = state["url"] or str(getattr(page_obj, "url", "") or "")
+        on_signup_host = "accounts.x.ai" in current or "x.ai" in current
+        if (
+            not state["ready"]
+            and not state["region_blocked"]
+            and (navigation_error or not on_signup_host)
+        ):
+            state = _wait_for_signup_page(page_obj, cancel_callback=cancel_callback)
+            current = state["url"] or str(getattr(page_obj, "url", "") or "")
+            on_signup_host = "accounts.x.ai" in current or "x.ai" in current
+
+        if state["region_blocked"]:
+            last_error = "当前代理出口地区不可用"
+        elif on_signup_host and (state["ready"] or not navigation_error):
+            if navigation_error and log_callback:
+                log_callback(
+                    "[Debug] 注册页导航等待异常，但已进入注册域，继续执行: "
+                    f"{navigation_error[:240]}"
+                )
+            break
+        elif not on_signup_host:
+            last_error = f"打开注册页失败，当前URL: {current or 'empty'}"
+            if navigation_error:
+                last_error = f"{last_error} ({navigation_error})"
+        elif navigation_error:
+            last_error = f"打开注册页失败: {navigation_error}"
+        else:
+            preview = state["text"].replace("\n", " ").strip()[:180]
+            last_error = f"注册页已打开但未出现可用控件: {preview or 'empty page'}"
+
+        if attempt < SIGNUP_NAVIGATION_ATTEMPTS:
             if log_callback:
-                log_callback("[*] 浏览器已启动")
-        _prepare_exit_ip(log_callback)
-
-    def _navigate_signup():
-        # 优先复用已有标签，避免反复 new_tab 堆积空窗口
-        _ensure_browser()
-        browser_obj = active_browser()
-        if browser_obj is None:
-            raise Exception("浏览器启动失败")
+                log_callback(
+                    f"[!] {last_error}，重启浏览器后重试 "
+                    f"({attempt + 1}/{SIGNUP_NAVIGATION_ATTEMPTS})"
+                )
+            continue
         try:
-            tabs = browser_obj.get_tabs() if browser_obj is not None else []
-            page_obj = tabs[-1] if tabs else browser_obj.new_tab()
+            stop_browser()
         except Exception:
-            page_obj = browser_obj.new_tab()
-        set_browser_session(browser_obj, page_obj)
-        page_obj.get(SIGNUP_URL)
-        page_obj.wait.doc_loaded()
-        # 确认真的进了注册域；about:blank / 错页直接失败
-        current = str(getattr(page_obj, "url", "") or "")
-        if "accounts.x.ai" not in current and "x.ai" not in current:
-            raise Exception(f"打开注册页失败，当前URL: {current or 'empty'}")
-
-    try:
-        _navigate_signup()
-    except Exception as e:
-        if log_callback:
-            log_callback(f"[Debug] 打开URL异常: {e}")
+            pass
+        raise Exception(last_error or "打开注册页失败")
+    else:
         try:
-            restart_browser(log_callback=log_callback, cancel_callback=cancel_callback)
-            _navigate_signup()
-        except Exception as e2:
-            # 导航彻底失败：关掉残留实例，避免空浏览器挂着
-            try:
-                stop_browser()
-            except Exception:
-                pass
-            raise Exception(f"打开注册页失败: {e2}") from e2
+            stop_browser()
+        except Exception:
+            pass
+        raise Exception(last_error or "打开注册页失败")
 
-    # 页面已 doc_loaded，短等即可；过长 sleep 会造成「进页卡顿」
     sleep_with_cancel(0.4, cancel_callback)
     if log_callback:
         log_callback(f"[*] 当前URL: {active_page().url if active_page() else ''}")
-    click_email_signup_button(
-        log_callback=log_callback, cancel_callback=cancel_callback
-    )
+    current_page = active_page() or page_obj
+    state = _signup_page_state(current_page)
+    if state.get("email_form"):
+        if log_callback:
+            log_callback("[*] 注册页已出现邮箱输入框，跳过「使用邮箱注册」按钮")
+    else:
+        click_email_signup_button(
+            timeout=15,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
 
 
 def has_profile_form(log_callback=None):

@@ -82,17 +82,20 @@ export function Button({
   );
 }
 
-export function Input({ className, ...props }: React.InputHTMLAttributes<HTMLInputElement>) {
-  return (
-    <input
-      className={cn(
-        "flex min-h-10 w-full rounded-lg border border-input bg-card px-3 py-2 text-sm text-foreground outline-none transition duration-200 placeholder:text-muted-foreground focus:border-primary/60 focus:ring-2 focus:ring-ring/15 disabled:cursor-not-allowed disabled:bg-muted disabled:opacity-60 sm:min-h-9",
-        className
-      )}
-      {...props}
-    />
-  );
-}
+export const Input = React.forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
+  function Input({ className, ...props }, ref) {
+    return (
+      <input
+        ref={ref}
+        className={cn(
+          "flex min-h-10 w-full rounded-lg border border-input bg-card px-3 py-2 text-sm text-foreground outline-none transition duration-200 placeholder:text-muted-foreground focus:border-primary/60 focus:ring-2 focus:ring-ring/15 disabled:cursor-not-allowed disabled:bg-muted disabled:opacity-60 sm:min-h-9",
+          className
+        )}
+        {...props}
+      />
+    );
+  }
+);
 
 export function Textarea({ className, ...props }: React.TextareaHTMLAttributes<HTMLTextAreaElement>) {
   return (

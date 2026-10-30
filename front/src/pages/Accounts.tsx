@@ -130,7 +130,9 @@ function grokiqResultLabel(result?: AccountRecord["grokiq_result"] | null) {
 }
 
 function grokiqDegraded(result?: AccountRecord["grokiq_result"] | null) {
-  return Boolean(result?.degraded);
+  if (!result) return false;
+  const verdict = String(result.verdict || "").trim().toLowerCase();
+  return Boolean(result.degraded) || verdict === "degraded" || verdict === "quarantined";
 }
 
 function accountHasRisk(item: Pick<AccountRecord, "bot_risk" | "grokiq_result">) {
@@ -219,11 +221,49 @@ function emailDisableLabel(status: string) {
 
 type ReloginRecoveryKind = "sso_timeout" | "sso_token_exchange";
 
+function isInvalidCredentials(item: Pick<AccountRecord, "failure_type" | "failure_reason" | "extra">): boolean {
+  if (item.failure_type === "invalid_credentials") return true;
+  const extraError = typeof item.extra?.relogin_error === "string" ? item.extra.relogin_error : "";
+  return /账号或密码错误|Wrong email address or password/i.test(`${item.failure_reason || ""} ${extraError}`);
+}
+
+function CredentialErrorHint({
+  item,
+  compact = false,
+}: {
+  item: AccountRecord;
+  compact?: boolean;
+}) {
+  if (!isInvalidCredentials(item)) return null;
+  const reason = item.failure_reason || String(item.extra?.relogin_error || "Wrong email address or password");
+  if (compact) {
+    return (
+      <div
+        role="status"
+        className="rounded-lg border border-red-200 bg-red-50 px-2 py-1.5 text-[11px] font-semibold leading-4 text-red-800"
+        title={reason}
+      >
+        账号或密码错误，不是 SSO 异常
+      </div>
+    );
+  }
+  return (
+    <div role="status" className="rounded-lg border border-red-200 bg-red-50/80 p-3.5 text-red-950 shadow-sm">
+      <div className="text-sm font-semibold leading-5">账号或密码错误</div>
+      <p className="mt-1 text-xs leading-5 text-red-800">
+        登录页提示 Wrong email address or password。这不是 SSO 超时，重复重登无法修复，请先核对邮箱和密码。
+      </p>
+      {reason ? <p className="mt-1 break-all text-xs text-red-700">{reason}</p> : null}
+    </div>
+  );
+}
+
 function reloginRecoveryKind(
-  item: Pick<AccountRecord, "status" | "cpa_status" | "failure_type" | "failure_reason" | "bot_risk" | "grokiq_result">,
+  item: Pick<AccountRecord, "status" | "cpa_status" | "failure_type" | "failure_reason" | "bot_risk" | "grokiq_result" | "extra">,
 ): ReloginRecoveryKind | null {
   // 重登成功后的旧记录可能还保留历史 failure_type；CPA 已成功时不再重复提醒。
   // 风控结论已经明确时，重复重登只会形成 sso_timeout -> 风控 -> 再重登的循环。
+  if (isInvalidCredentials(item)) return null;
   if (accountHasRisk(item) || item.status !== "failure" || item.cpa_status === "success") return null;
   if (item.failure_type === "sso_timeout") return "sso_timeout";
   if (
@@ -322,7 +362,7 @@ function ReloginRecoveryHint({
             </div>
             <div className="text-sm font-semibold leading-5">{running ? (stage || "正在重新登录") : title}</div>
             <p className="mt-1 text-xs leading-5 text-amber-800">
-              点击立即重登刷新 SSO；系统会先检查账号风控，再重建 CPA / Grok2API 授权文件。
+              点击立即重登刷新 SSO，并直接重建 CPA / Grok2API 授权文件。
             </p>
           </div>
         </div>
@@ -501,6 +541,7 @@ function AccountDetails({
         </div>
       </div>
 
+      <CredentialErrorHint item={detail} />
       <ReloginRecoveryHint
         item={detail}
         running={reloginRunning}
@@ -577,7 +618,7 @@ function AccountDetails({
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-[7rem_minmax(0,1fr)]">
               <div className="text-xs font-medium text-red-700">异常类型</div>
               <div className="break-words text-sm text-slate-800">
-                {detail.failure_type || detail.exception_type || "未分类异常"}
+                {detail.failure_type === "invalid_credentials" ? "账号密码错误" : (detail.failure_type || detail.exception_type || "未分类异常")}
               </div>
               <div className="text-xs font-medium text-red-700">异常原因</div>
               <div className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-800">
@@ -1043,7 +1084,7 @@ export function AccountsPage() {
 
   const onBatchRelogin = async () => {
     if (!selectedIds.length) return;
-    if (!window.confirm(`按顺序重新登录选中的 ${selectedIds.length} 个账号，检查风控并刷新授权文件？`)) return;
+    if (!window.confirm(`按顺序重新登录选中的 ${selectedIds.length} 个账号，刷新 SSO 并重建授权文件？`)) return;
     setBatchMenuOpen(false);
     setBatchBusy("relogin");
     try {
@@ -1130,7 +1171,7 @@ export function AccountsPage() {
     }
     if (
       confirm
-      && !window.confirm(`使用已保存的账号密码重新登录 ${item.email}，刷新 SSO、检查风控并重建授权文件？`)
+      && !window.confirm(`使用已保存的账号密码重新登录 ${item.email}，刷新 SSO 并重建授权文件？`)
     ) return;
     try {
       const result = await api.startRelogin(item.id);
@@ -1359,7 +1400,7 @@ export function AccountsPage() {
               <option value="not_applicable">不适用</option>
             </Select>
             </div>
-            <div className="w-full sm:w-44"><label htmlFor="account-risk-filter" className="mb-1.5 block text-xs font-medium text-slate-500">风控状态</label>
+            <div className="w-full sm:w-48"><label htmlFor="account-risk-filter" className="mb-1.5 block text-xs font-medium text-slate-500">风控状态</label>
             <Select
               id="account-risk-filter"
               value={botRiskFilter}
@@ -1371,6 +1412,7 @@ export function AccountsPage() {
             >
               <option value="">不限</option>
               <option value="1">异常账号</option>
+              <option value="grokiq">GrokIQ 降智</option>
               <option value="0">正常账号</option>
               <option value="unknown">未检查 / 未知</option>
             </Select>
@@ -1462,6 +1504,7 @@ export function AccountsPage() {
                           </div>
                           <div className="mt-2 space-y-2">
                             <MobileStatusGrid item={item} />
+                            <CredentialErrorHint item={item} compact />
                             <ReloginRecoveryHint
                               item={item}
                               compact
@@ -1573,7 +1616,11 @@ export function AccountsPage() {
                                     </Badge>
                                   </div>
                                 ) : null}
-                                {reloginRecoveryKind(item) ? (
+                                {isInvalidCredentials(item) ? (
+                                  <div className="mt-2">
+                                    <CredentialErrorHint item={item} compact />
+                                  </div>
+                                ) : reloginRecoveryKind(item) ? (
                                   <div className="mt-2">
                                     <ReloginRecoveryHint
                                       item={item}

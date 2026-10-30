@@ -233,6 +233,12 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
             self.assertEqual(store.count_results(bot_risk="normal"), 2)
             unknown_rows = store.list_results(bot_risk="unknown")
             self.assertEqual([row["email"] for row in unknown_rows], ["unknown@example.com"])
+            grokiq_rows = store.list_results(bot_risk="grokiq")
+            self.assertEqual(
+                [row["email"] for row in grokiq_rows],
+                ["grokiq-degraded@example.com"],
+            )
+            self.assertEqual(store.count_results(bot_risk="degraded"), 1)
 
     def test_list_result_ids_matches_filters_and_list_order(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -333,8 +339,18 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
                 }
             )
 
+            store.add_result(
+                {
+                    "email": "badpass@outlook.com",
+                    "status": "failure",
+                    "failure_type": "invalid_credentials",
+                    "failure_reason": "账号或密码错误: Wrong email address or password.",
+                }
+            )
+
             self.assertTrue(store.has_registered_or_consumed("risk@outlook.com"))
             self.assertTrue(store.has_registered_or_consumed("sso@outlook.com"))
+            self.assertTrue(store.has_registered_or_consumed("badpass@outlook.com"))
             self.assertFalse(store.has_registered_or_consumed("timeout@outlook.com"))
 
     def test_successful_relogin_marks_registration_success_and_clears_failure(self):
@@ -507,6 +523,52 @@ class RegistrationRepositoryMigrationTests(unittest.TestCase):
             refreshed = store.get_results_by_ids([account_id])[0]
             self.assertEqual(int(refreshed["bot_risk"] or 0), 1)
             self.assertEqual(store.backfill_grokiq_degraded_bot_risk(), 0)
+
+    def test_backfill_marks_grokiq_quarantined_verdict_as_bot_risk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            account_id = store.add_result(
+                {
+                    "email": "grokiq-quarantined@example.com",
+                    "status": "success",
+                    "bot_risk": False,
+                    "extra_json": json.dumps({"grokiq_result": {"verdict": "quarantined"}}),
+                }
+            )
+            self.assertEqual(store.backfill_grokiq_degraded_bot_risk(), 1)
+            refreshed = store.get_results_by_ids([account_id])[0]
+            self.assertEqual(int(refreshed["bot_risk"] or 0), 1)
+
+    def test_invalid_credentials_relogin_rewrites_sso_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = RegistrationRepository(Path(tmp) / "results.sqlite3")
+            account_id = store.add_result(
+                {
+                    "email": "badpass-after-sso@example.com",
+                    "status": "failure",
+                    "success": False,
+                    "failure_type": "sso_timeout",
+                    "failure_reason": "未获取到 sso cookie",
+                }
+            )
+
+            self.assertTrue(
+                store.update_relogin_result(
+                    account_id,
+                    status="failed",
+                    error="账号或密码错误: Wrong email address or password.",
+                    failure_type="invalid_credentials",
+                    failure_reason="账号或密码错误: Wrong email address or password.",
+                )
+            )
+
+            refreshed = store.get_results_by_ids([account_id])[0]
+            extra = json.loads(refreshed["extra_json"])
+            self.assertEqual(refreshed["status"], "failure")
+            self.assertEqual(refreshed["failure_type"], "invalid_credentials")
+            self.assertIn("Wrong email address or password", refreshed["failure_reason"])
+            self.assertEqual(extra["relogin_status"], "failed")
+            self.assertIn("账号或密码错误", extra["relogin_error"])
 
 
 if __name__ == "__main__":

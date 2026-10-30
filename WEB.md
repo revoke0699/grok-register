@@ -84,6 +84,8 @@ backend/tests/         # 后端单元测试
 - `GET/PUT /api/config` 读写配置
 - `POST /api/job/start` 启动注册
 - `POST /api/job/stop` 停止注册
+- `GET /api/accounts/relogin/logs` 重新登录实时日志
+- `POST /api/accounts/relogin/stop` 停止重新登录
 - `POST /api/browser/kill-all` 请求停止任务并终止全部托管浏览器进程
 - `GET /api/job/logs` 轮询日志
 - `POST /api/connectivity` 连通性检查
@@ -92,7 +94,7 @@ backend/tests/         # 后端单元测试
 
 设置页可选择 `Camoufox`（默认）或 `CloakBrowser` 浏览器后端，并可启用“无头浏览器”。两个后端共用注册步骤、代理、语言与结果处理逻辑。
 
-账号重新登录获取新 SSO 后会自动执行与批量 SSO Check 相同的详细风控检查。`botFlagSource=0` 继续重建授权文件；非 `0` 会写入账号风控标记并停止本次授权重建；字段为空时按既有策略短时复查。
+账号重新登录与注册共用低流量缓存。默认使用较少节省（只缓存 grok.com CDN）；更多节省会额外缓存 accounts.x.ai 哈希资源，但设置页会按文件内容标出 Castle / Mixpanel / Turnstile 等高风险 JS，这些文件即使已缓存也不会回放。获取新 SSO 后直接重建 CPA / Grok2API 授权文件。登录页提示 `Wrong email address or password` 时记为账号密码错误，不再当成 SSO 超时。上游已不再下发 `bfs` / `botFlagSource`，重登不再根据该字段中断；账号级降智检测交给 GrokIQ。
 
 注册页的“终止全部浏览器”用于异常兜底：先请求停止当前任务，再终止 Camoufox 与 CloakBrowser 进程树并清理本项目创建的临时资料目录。紧急终止后，下一次手动启动注册任务才会重新允许浏览器启动。
 

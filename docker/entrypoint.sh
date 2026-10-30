@@ -31,7 +31,7 @@ def env_int(name, default, minimum, maximum):
 browser_engine = os.environ.get("GROK_BROWSER_ENGINE", "camoufox").strip().lower()
 config["browser_engine"] = browser_engine if browser_engine in {"camoufox", "cloakbrowser"} else "camoufox"
 config["browser_headless"] = False
-config["browser_traffic_savings_level"] = "more"
+config["browser_traffic_savings_level"] = "standard"
 config["cpa_auth_dir"] = "data/cpa_auth"
 config["grok2api_auth_dir"] = "data/grok2api_auth"
 config["outlookemail_api_base"] = os.environ.get(

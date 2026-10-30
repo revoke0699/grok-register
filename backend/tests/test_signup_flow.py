@@ -183,5 +183,137 @@ class SignupFlowTests(unittest.TestCase):
         fill_code.assert_called_once_with("134771")
 
 
+class _SignupPage:
+    def __init__(self, error=None, url="https://accounts.x.ai/sign-up?redirect=grok-com"):
+        self.error = error
+        self.url = url
+        self.calls = []
+        self.run_js_result = {
+            "url": url,
+            "text": "Sign up with email",
+            "ready": True,
+            "email_form": False,
+            "signup_action": True,
+        }
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.error:
+            raise self.error
+
+    def run_js(self, script):
+        return dict(self.run_js_result)
+
+
+class SignupNavigationTests(unittest.TestCase):
+    def test_navigation_waits_only_for_dom_content(self):
+        page = _SignupPage()
+        browser = mock.Mock()
+        browser.get_tabs.return_value = [page]
+        with (
+            mock.patch.object(signup_flow, "active_browser", return_value=browser),
+            mock.patch.object(signup_flow, "set_browser_session"),
+            mock.patch.object(signup_flow, "sleep_with_cancel"),
+            mock.patch.object(signup_flow, "click_email_signup_button") as click_email,
+            mock.patch.object(signup_flow, "active_page", return_value=page),
+        ):
+            signup_flow.open_signup_page()
+
+        self.assertEqual(
+            page.calls,
+            [
+                (
+                    signup_flow.SIGNUP_URL,
+                    {
+                        "wait_until": "domcontentloaded",
+                        "timeout": signup_flow.SIGNUP_NAVIGATION_TIMEOUT_MS,
+                    },
+                )
+            ],
+        )
+        click_email.assert_called_once()
+
+    def test_navigation_timeout_is_soft_when_signup_ui_is_ready(self):
+        page = _SignupPage(TimeoutError("Timeout 30000ms exceeded"))
+        logs = []
+        browser = mock.Mock()
+        browser.get_tabs.return_value = [page]
+        with (
+            mock.patch.object(signup_flow, "active_browser", return_value=browser),
+            mock.patch.object(signup_flow, "set_browser_session"),
+            mock.patch.object(signup_flow, "sleep_with_cancel"),
+            mock.patch.object(signup_flow, "click_email_signup_button"),
+            mock.patch.object(signup_flow, "active_page", return_value=page),
+            mock.patch.object(signup_flow, "restart_browser") as restart,
+        ):
+            signup_flow.open_signup_page(log_callback=logs.append)
+
+        restart.assert_not_called()
+        self.assertTrue(any("已进入注册域" in message for message in logs))
+
+    def test_proxy_timeout_restarts_browser_when_page_stays_blank(self):
+        blank = _SignupPage(
+            Exception("Page.goto: NS_ERROR_PROXY_GATEWAY_TIMEOUT"),
+            url="about:blank",
+        )
+        blank.run_js_result = {
+            "url": "about:blank",
+            "text": "",
+            "ready": False,
+            "email_form": False,
+            "signup_action": False,
+        }
+        ready = _SignupPage()
+        browsers = [
+            mock.Mock(get_tabs=mock.Mock(return_value=[blank])),
+            mock.Mock(get_tabs=mock.Mock(return_value=[ready])),
+        ]
+        logs = []
+
+        def active_browser():
+            return browsers[0]
+
+        def restart(**kwargs):
+            browsers.pop(0)
+
+        with (
+            mock.patch.object(signup_flow, "active_browser", side_effect=active_browser),
+            mock.patch.object(signup_flow, "set_browser_session"),
+            mock.patch.object(signup_flow, "sleep_with_cancel"),
+            mock.patch.object(
+                signup_flow,
+                "_wait_for_signup_page",
+                side_effect=lambda page_obj, timeout=12, cancel_callback=None: signup_flow._signup_page_state(page_obj),
+            ),
+            mock.patch.object(signup_flow, "click_email_signup_button"),
+            mock.patch.object(signup_flow, "active_page", return_value=ready),
+            mock.patch.object(signup_flow, "restart_browser", side_effect=restart),
+            mock.patch.object(signup_flow, "stop_browser"),
+        ):
+            signup_flow.open_signup_page(log_callback=logs.append)
+
+        self.assertTrue(any("NS_ERROR_PROXY_GATEWAY_TIMEOUT" in message for message in logs))
+        self.assertTrue(any("重启浏览器后重试" in message for message in logs))
+
+    def test_skips_email_button_when_email_form_is_already_visible(self):
+        page = _SignupPage()
+        page.run_js_result["email_form"] = True
+        page.run_js_result["signup_action"] = False
+        browser = mock.Mock()
+        browser.get_tabs.return_value = [page]
+        with (
+            mock.patch.object(signup_flow, "active_browser", return_value=browser),
+            mock.patch.object(signup_flow, "set_browser_session"),
+            mock.patch.object(signup_flow, "sleep_with_cancel"),
+            mock.patch.object(signup_flow, "click_email_signup_button") as click_email,
+            mock.patch.object(signup_flow, "active_page", return_value=page),
+        ):
+            logs = []
+            signup_flow.open_signup_page(log_callback=logs.append)
+
+        click_email.assert_not_called()
+        self.assertTrue(any("跳过「使用邮箱注册」按钮" in message for message in logs))
+
+
 if __name__ == "__main__":
     unittest.main()

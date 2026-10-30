@@ -7,6 +7,7 @@
 - `grok2api_auth/`：Grok2API 授权 JSON。
 - `web_auth.json`：Web 唯一管理员的哈希认证信息。
 - `.next_action_id.cache`：授权流程的本地运行缓存。
+- `browser-cache/`：低流量模式缓存的 grok.com / accounts.x.ai 静态资源。
 - 其他子目录：历史备份或运行缓存。
 
 除本说明文件外，`data/` 内容均已由 `.gitignore` 忽略。

@@ -12,15 +12,19 @@ from typing import Callable, Optional
 from backend.automation.session import (
     active_browser,
     active_page,
+    low_traffic_enabled,
     page,
     restart_browser,
     set_browser_session,
     start_browser,
+    traffic_savings_level,
 )
 from backend.registration.signup_flow import (
     _dismiss_cookie_consent,
     _native_click_action,
     _native_input_candidates,
+    _should_retry_cf,
+    _try_click_turnstile_frame,
     _try_sync_turnstile,
 )
 
@@ -28,9 +32,72 @@ from backend.registration.signup_flow import (
 SIGNIN_URL = "https://accounts.x.ai/sign-in"
 SIGNIN_NAVIGATION_ATTEMPTS = 3
 SIGNIN_NAVIGATION_TIMEOUT_MS = 45_000
+EMAIL_STEP_ATTEMPTS = 4
+EMAIL_STEP_CLICK_WAIT = 3.0
+PASSWORD_STEP_WAIT = 8.0
+POST_SUBMIT_ERROR_WINDOW = 2.5
+TYPE_RETRY_SLEEP = 0.2
+TYPE_SEQUENTIAL_DELAY_MS = 12
+SSO_POLL_INTERVAL = 0.2
+TURNSTILE_APPEAR_WAIT = 12.0
+TURNSTILE_CLICK_INTERVAL = 3.0
+
+CREDENTIAL_ERROR_PHRASES = (
+    "wrong email address or password",
+    "incorrect email or password",
+    "invalid email or password",
+    "email or password is incorrect",
+    "incorrect password",
+    "invalid credentials",
+    "wrong password",
+    "邮箱地址或密码错误",
+    "邮箱或密码错误",
+    "账号或密码错误",
+    "用户名或密码错误",
+    "密码错误",
+)
 
 
-def _wait_until(predicate: Callable[[], bool], timeout: float, interval: float = 0.25) -> bool:
+class InvalidLoginCredentials(RuntimeError):
+    """登录页明确提示账号或密码错误，不是 SSO 超时。"""
+
+
+def looks_like_invalid_credentials(text: str) -> bool:
+    blob = " ".join(str(text or "").lower().split())
+    if not blob:
+        return False
+    return any(phrase in blob for phrase in CREDENTIAL_ERROR_PHRASES)
+
+
+def credential_error_from_texts(*parts: str) -> str:
+    """从页面可见错误或正文中提取账号密码错误原文。"""
+    for part in parts:
+        blob = " ".join(str(part or "").split())
+        if not blob:
+            continue
+        lower = blob.lower()
+        for phrase in CREDENTIAL_ERROR_PHRASES:
+            index = lower.find(phrase)
+            if index < 0:
+                continue
+            excerpt = blob[index:index + len(phrase)].rstrip(".,;:，。；：")
+            return f"{excerpt}."
+        if looks_like_invalid_credentials(blob) and len(blob) <= 300:
+            return blob
+    return ""
+
+
+def raise_if_login_error(text: str = "") -> None:
+    message = str(text or "").strip() or _visible_login_error()
+    if not message:
+        return
+    credential = credential_error_from_texts(message)
+    if credential or looks_like_invalid_credentials(message):
+        raise InvalidLoginCredentials(f"账号或密码错误: {credential or message}")
+    raise RuntimeError(f"登录失败: {message}")
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float, interval: float = 0.15) -> bool:
     deadline = time.time() + max(float(timeout or 0), 0)
     while time.time() < deadline:
         try:
@@ -47,27 +114,72 @@ def _visible_login_error() -> str:
     try:
         value = page.run_js(
             r"""
-const selectors = [
-  '[role="alert"]', '[aria-live="assertive"]', '[aria-live="polite"]',
-  '[data-testid*="error" i]', '[class*="error" i]'
+const ignore = new Set(['邮箱','密码','登录','Email','Password','Sign in','Log in','Forgot your password?','忘记密码']);
+const phrases = [
+  'wrong email address or password',
+  'incorrect email or password',
+  'invalid email or password',
+  'email or password is incorrect',
+  'incorrect password',
+  'invalid credentials',
+  'wrong password',
+  '邮箱地址或密码错误',
+  '邮箱或密码错误',
+  '账号或密码错误',
+  '用户名或密码错误',
+  '密码错误'
 ];
-for (const selector of selectors) {
+const visible = (node) => {
+  if (!node) return false;
+  const style = getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && rect.width > 0 && rect.height > 0;
+};
+const clean = (value, max = 300) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+const reddish = (node) => {
+  const color = getComputedStyle(node).color || '';
+  const rgb = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+  if (!rgb) return /red|tomato|crimson|#(?:e|f|c)[0-9a-f]{2}(?:[0-9a-f]{2}){0,2}/i.test(color);
+  return Number(rgb[1]) > 150 && Number(rgb[2]) < 110 && Number(rgb[3]) < 110;
+};
+const collect = [];
+const push = (text) => {
+  const value = clean(text);
+  if (value && !ignore.has(value) && !collect.includes(value)) collect.push(value);
+};
+for (const selector of ['[role="alert"]','[aria-live="assertive"]','[aria-live="polite"]','[data-testid*="error" i]','[class*="error" i]']) {
   for (const node of document.querySelectorAll(selector)) {
-    const style = getComputedStyle(node);
-    const rect = node.getBoundingClientRect();
-    if (style.display === 'none' || style.visibility === 'hidden' || !rect.width || !rect.height) continue;
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-    if (text && text.length <= 300 && !['邮箱','密码','登录','Email','Password','Sign in','Log in'].includes(text)) return text;
+    if (visible(node)) push(node.innerText || node.textContent);
   }
 }
-return '';
+const password = document.querySelector('input[type="password"]');
+if (password) {
+  for (const id of String(password.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean)) {
+    const node = document.getElementById(id);
+    if (visible(node)) push(node.innerText || node.textContent);
+  }
+  let root = password.parentElement;
+  for (let depth = 0; depth < 4 && root; depth += 1, root = root.parentElement) {
+    for (const node of root.querySelectorAll('p,span,div,small,strong,em,label')) {
+      if (!visible(node) || !reddish(node)) continue;
+      push(node.innerText || node.textContent);
+    }
+  }
+}
+const body = clean(document.body && document.body.innerText, 2500);
+const lower = body.toLowerCase();
+for (const phrase of phrases) {
+  const index = lower.indexOf(phrase);
+  if (index >= 0) return body.slice(index, index + phrase.length);
+}
+return collect.find((text) => phrases.some((phrase) => text.toLowerCase().includes(phrase))) || collect[0] || '';
             """
         )
     except Exception:
         return ""
     text = str(value or "").strip()
     # 页面会把字段标题（例如“邮箱”）挂在 error class 上；它不是登录失败原因。
-    if text in {"邮箱", "密码", "登录", "Email", "Password", "Sign in", "Log in"}:
+    if text in {"邮箱", "密码", "登录", "Email", "Password", "Sign in", "Log in", "Forgot your password?"}:
         return ""
     return text
 
@@ -92,6 +204,10 @@ for (const selector of ['[role="alert"]','[aria-live="assertive"]','[aria-live="
     if (text && !['邮箱','密码','登录','Email','Password','Sign in','Log in'].includes(text) && !errors.includes(text)) errors.push(text);
   }
 }
+const body = clean(document.body && document.body.innerText, 1800);
+for (const phrase of ['Wrong email address or password','Incorrect email or password','Invalid credentials','邮箱或密码错误','账号或密码错误','密码错误']) {
+  if (body.toLowerCase().includes(phrase.toLowerCase()) && !errors.includes(phrase)) errors.unshift(phrase);
+}
 const controls = [...document.querySelectorAll('input,button,[role="button"]')]
   .filter(visible)
   .map(node => {
@@ -115,10 +231,6 @@ return {
     except Exception:
         pass
     return diagnostics
-
-
-EMAIL_STEP_ATTEMPTS = 4
-EMAIL_STEP_CLICK_WAIT = 6.0
 
 
 def _reveal_email_input(log_callback=None):
@@ -201,9 +313,12 @@ def _type_login_value(element, value: str, *, kind: str, log_callback=None, atte
         if current_element is not None:
             try:
                 locator = current_element._raw
-                locator.click(force=True, timeout=5000)
+                locator.click(force=True, timeout=3000)
+                locator.fill(text, force=True)
+                if str(locator.input_value() or "").strip() == target:
+                    return True
                 locator.fill("", force=True)
-                locator.press_sequentially(text, delay=45)
+                locator.press_sequentially(text, delay=TYPE_SEQUENTIAL_DELAY_MS)
                 if str(locator.input_value() or "").strip() == target:
                     return True
             except Exception as exc:
@@ -220,7 +335,7 @@ def _type_login_value(element, value: str, *, kind: str, log_callback=None, atte
                 pass
             current_element = fresh[0]
         if attempt < attempts:
-            time.sleep(0.6)
+            time.sleep(TYPE_RETRY_SLEEP)
     return False
 
 
@@ -268,11 +383,11 @@ return {
     return state
 
 
-def _wait_for_signin_page(page_obj, timeout: float = 12) -> dict:
+def _wait_for_signin_page(page_obj, timeout: float = 8) -> dict:
     deadline = time.time() + max(float(timeout or 0), 0)
     state = _signin_page_state(page_obj)
     while not state["ready"] and not state["region_blocked"] and time.time() < deadline:
-        time.sleep(0.25)
+        time.sleep(0.15)
         state = _signin_page_state(page_obj)
     return state
 
@@ -358,10 +473,13 @@ def _read_sso_cookie() -> str:
     return fallback
 
 
-def _wait_for_login_sso(timeout: int, log_callback=None) -> str:
+def _wait_for_login_sso(timeout: int, log_callback=None, turnstile_retried: bool = False) -> str:
     """自然等待登录跳转与 SSO，期间不主动导航到 grok.com。"""
     deadline = time.time() + max(int(timeout or 90), 30)
     last_log = 0.0
+    wait_cf_since = time.time()
+    last_cf_retry_at = time.time() if turnstile_retried else 0.0
+    last_click_at = 0.0
     while time.time() < deadline:
         token = _read_sso_cookie()
         if token:
@@ -373,12 +491,146 @@ def _wait_for_login_sso(timeout: int, log_callback=None) -> str:
             last_log = now
             current = str(getattr(active_page(), "url", "") or "")
             log_callback(f"[*] 等待重新登录 SSO... 剩余 {max(int(deadline - now), 0)}s | url={current[:90]}")
-        error = _visible_login_error()
-        if error:
-            raise RuntimeError(f"登录失败: {error}")
-        time.sleep(0.4)
+        raise_if_login_error()
+        if _still_on_signin():
+            full_sync = _should_retry_cf(wait_cf_since, last_cf_retry_at, now)
+            if full_sync or now - last_click_at >= TURNSTILE_CLICK_INTERVAL:
+                if full_sync:
+                    last_cf_retry_at = now
+                last_click_at = now
+                _recover_login_turnstile(log_callback, full_sync=full_sync)
+        time.sleep(SSO_POLL_INTERVAL)
+    diagnostics = capture_login_diagnostics()
+    credential = credential_error_from_texts(
+        diagnostics.get("visible_error", ""),
+        diagnostics.get("page_text", ""),
+    )
+    if credential:
+        raise InvalidLoginCredentials(f"账号或密码错误: {credential}")
     current = str(getattr(active_page(), "url", "") or "")
     raise RuntimeError(f"重新登录超时，未获取到 SSO；当前 URL: {current[:120]}")
+
+
+def _login_turnstile_js(script: str):
+    try:
+        return page.run_js(script)
+    except Exception:
+        return None
+
+
+def _login_turnstile_mounted() -> bool:
+    """Turnstile 已挂载即可等待，不要求可见框或已有 token。"""
+    value = _login_turnstile_js(
+        r"""
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+return !!cfInput
+  || !!document.querySelector(
+    'iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]'
+  );
+        """
+    )
+    return bool(value)
+
+
+def _login_turnstile_solved() -> bool:
+    value = _login_turnstile_js(
+        r"""
+try {
+  const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
+  if (byInput.length >= 80) return true;
+  if (window.turnstile && typeof turnstile.getResponse === 'function') {
+    return String(turnstile.getResponse() || '').trim().length >= 80;
+  }
+  return false;
+} catch (e) {
+  return false;
+}
+        """
+    )
+    return bool(value)
+
+
+def _still_on_signin() -> bool:
+    try:
+        return "sign-in" in str(getattr(active_page(), "url", "") or "")
+    except Exception:
+        return False
+
+
+def _login_turnstile_needs_resubmit() -> bool:
+    if not _still_on_signin():
+        return False
+    return _login_turnstile_mounted() or _login_turnstile_solved()
+
+
+def _prepare_login_turnstile(log_callback=None) -> None:
+    """先等人机框挂载并点击，再同步 token，避免框还没出来就点登录。"""
+    if _login_turnstile_solved():
+        return
+    if not _login_turnstile_mounted():
+        if log_callback:
+            log_callback("[*] 等待登录页安全验证出现...")
+        last_click_at = 0.0
+
+        def _ready_or_click() -> bool:
+            nonlocal last_click_at
+            if _login_turnstile_solved():
+                return True
+            now = time.time()
+            if now - last_click_at >= TURNSTILE_CLICK_INTERVAL:
+                _try_click_turnstile_frame(log_callback=log_callback)
+                last_click_at = now
+            return _login_turnstile_mounted() or _login_turnstile_solved()
+
+        appeared = _wait_until(_ready_or_click, TURNSTILE_APPEAR_WAIT, interval=0.2)
+        if _login_turnstile_solved():
+            return
+        if not appeared:
+            # DOM 可能还没挂上，先按 frame 点一次，避免完全跳过点击。
+            _try_click_turnstile_frame(log_callback=log_callback)
+            if _login_turnstile_solved():
+                return
+            if not _login_turnstile_mounted():
+                if log_callback:
+                    log_callback("[*] 登录页未出现 Turnstile，继续提交登录")
+                return
+    if not _try_sync_turnstile(
+        log_callback=log_callback,
+        cancel_callback=None,
+        reason="等待登录安全验证",
+    ):
+        raise RuntimeError("登录安全验证未通过")
+
+
+def _recover_login_turnstile(log_callback=None, *, full_sync: bool = False) -> None:
+    """登录后仍停在登录页时，自动重试点 Turnstile，必要时再提交。"""
+    if not _still_on_signin():
+        return
+    if _login_turnstile_solved():
+        _click_submit(("登录", "sign in", "log in", "continue"))
+        return
+    _try_click_turnstile_frame(log_callback=log_callback)
+    if _login_turnstile_solved():
+        _click_submit(("登录", "sign in", "log in", "continue"))
+        return
+    if not full_sync:
+        return
+    if log_callback:
+        log_callback("[*] 登录后仍停在登录页，补做安全验证后重试提交")
+    if not _try_sync_turnstile(
+        log_callback=log_callback,
+        cancel_callback=None,
+        reason="登录后补做安全验证",
+    ):
+        if log_callback:
+            log_callback("[Debug] 登录后安全验证仍未通过，继续等待并重试点击")
+        return
+    _click_submit(("登录", "sign in", "log in", "continue"))
+
+
+def _resubmit_login_after_turnstile(log_callback=None) -> None:
+    """兼容旧调用：完整同步 Turnstile 后再点登录。"""
+    _recover_login_turnstile(log_callback, full_sync=True)
 
 
 def login_with_password(
@@ -395,6 +647,13 @@ def login_with_password(
         raise ValueError("账号记录缺少有效邮箱")
     if not secret:
         raise ValueError("账号记录缺少密码")
+
+    if log_callback:
+        if low_traffic_enabled():
+            level = "更多节省" if traffic_savings_level() == "more" else "较少节省"
+            log_callback(f"[*] 重新登录使用低流量模式（{level}）")
+        else:
+            log_callback("[*] 重新登录未开启低流量模式")
 
     _navigate_signin(log_callback=log_callback)
     _dismiss_cookie_consent(log_callback)
@@ -417,7 +676,8 @@ def login_with_password(
     if not password_inputs:
         if not _click_submit(("下一步", "next", "continue")):
             raise RuntimeError("邮箱页未找到下一步按钮")
-        if not _wait_until(lambda: bool(_native_input_candidates("password")), 15):
+        if not _wait_until(lambda: bool(_native_input_candidates("password")), PASSWORD_STEP_WAIT):
+            raise_if_login_error()
             detail = _visible_login_error()
             raise RuntimeError(detail or "登录页未出现密码输入框")
         password_inputs = _native_input_candidates("password")
@@ -428,28 +688,38 @@ def login_with_password(
         log_callback=log_callback,
     ):
         raise RuntimeError("密码输入失败")
-    if not _try_sync_turnstile(
-        log_callback=log_callback,
-        cancel_callback=None,
-        reason="等待登录安全验证",
-    ):
-        raise RuntimeError("登录安全验证未通过")
+    _prepare_login_turnstile(log_callback=log_callback)
     if not _click_submit(("登录", "sign in", "log in", "continue")):
         raise RuntimeError("密码页未找到登录按钮")
 
     # 先给表单错误一个快速反馈窗口；正常成功会立即进入 redirect。
-    for _ in range(12):
-        time.sleep(0.25)
-        error = _visible_login_error()
-        if error:
-            raise RuntimeError(f"登录失败: {error}")
+    # 这里只做轻量点击，避免完整 Turnstile 流程挡住密码错误提示。
+    turnstile_retried = False
+    deadline = time.time() + POST_SUBMIT_ERROR_WINDOW
+    for _ in range(20):
+        token = _read_sso_cookie()
+        if token:
+            if log_callback:
+                log_callback("[*] 重新登录成功，已获取新的 sso cookie")
+            return token
+        raise_if_login_error()
         try:
             if "sign-in" not in str(active_page().url or ""):
                 break
         except Exception:
             break
+        if _login_turnstile_needs_resubmit():
+            turnstile_retried = True
+            _recover_login_turnstile(log_callback, full_sync=False)
+        if time.time() >= deadline:
+            break
+        time.sleep(0.12)
 
-    return _wait_for_login_sso(timeout=max(int(timeout or 90), 30), log_callback=log_callback)
+    return _wait_for_login_sso(
+        timeout=max(int(timeout or 90), 30),
+        log_callback=log_callback,
+        turnstile_retried=turnstile_retried,
+    )
 
 
 def capture_login_failure(path: Path) -> str:

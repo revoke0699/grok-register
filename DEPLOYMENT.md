@@ -174,7 +174,7 @@ GitHub Actions 规则：
 - Pull Request：只测试和构建，不发布
 - `workflow_dispatch`：支持手动触发
 
-注册机启动时会立即读取 GitHub 最新 Release，之后每 1 小时复查。管理页面
+注册机启动时会立即读取 GitHub 最新 Release，之后每 15 分钟复查。管理页面
 发现新版本后自动弹出可关闭提示；同一版本关闭一次后不再重复提示。登录后访问
 `/overview?preview-update=1` 可以预览弹窗，不需要先创建测试 Release。实际升级
 继续通过 `docker compose pull && docker compose up -d --force-recreate` 完成。

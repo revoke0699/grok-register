@@ -34,6 +34,7 @@ from backend.integrations import sso_checker as _sso_checker
 from backend.mailbox import cloudflare_worker as cloudflare_provider
 from backend.mailbox import cloud_mail as cloudmail_provider
 from backend.mailbox import duck_mail as duckmail_provider
+from backend.mailbox import icloud_mail as icloud_provider
 from backend.mailbox import mail_nest as mailnest_provider
 from backend.mailbox import outlook_pool as outlookemail_provider
 from backend.mailbox import yyds_mail as yyds_provider
@@ -335,7 +336,7 @@ DEFAULT_CONFIG = {
     "browser_headless": False,
     "browser_locale": "en-US",
     "browser_low_traffic_mode": True,
-    "browser_traffic_savings_level": "more",
+    "browser_traffic_savings_level": "standard",
     "close_browser_on_stop": False,
     "log_level": "info",
     "register_count": 1,
@@ -387,6 +388,12 @@ DEFAULT_CONFIG = {
     "mailnest_project_code": "x-ai001",
     # YYDS：留空自动选已验证域名；填写则固定该域名
     "yyds_default_domain": "",
+    # iCloud：事先在 Veilimage 配置好的邮箱，不现场生成
+    "icloud_api_base": "https://mail.veilimage.com",
+    "icloud_email": "",
+    "icloud_code_key": "",
+    "icloud_emails": "",
+    "icloud_code_keys": "",
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
 }
@@ -532,6 +539,7 @@ FAIL_BROWSER = "browser"
 FAIL_CPA = "cpa"
 FAIL_STUCK = "stuck_retry"
 FAIL_SSO = "sso_timeout"
+FAIL_INVALID_CREDENTIALS = "invalid_credentials"
 FAIL_OTHER = "other"
 
 FAIL_LABELS = {
@@ -543,19 +551,29 @@ FAIL_LABELS = {
     FAIL_CPA: "CPA失败",
     FAIL_STUCK: "流程卡住",
     FAIL_SSO: "SSO超时",
+    FAIL_INVALID_CREDENTIALS: "账号密码错误",
     FAIL_OTHER: "其它",
 }
 
 
 def classify_failure(exc) -> str:
+    from backend.registration.login_flow import (
+        InvalidLoginCredentials,
+        looks_like_invalid_credentials,
+    )
+
     if isinstance(exc, EmailDomainRejected):
         return FAIL_DOMAIN
     if isinstance(exc, _rf.AccountAlreadyRegistered):
         return FAIL_ALREADY_REGISTERED
     if isinstance(exc, RegistrationRiskDenied):
         return FAIL_RISK
+    if isinstance(exc, InvalidLoginCredentials):
+        return FAIL_INVALID_CREDENTIALS
     msg = str(exc or "")
     low = msg.lower()
+    if looks_like_invalid_credentials(msg) or "账号或密码错误" in msg:
+        return FAIL_INVALID_CREDENTIALS
     if isinstance(exc, AccountRetryNeeded) or "达到最大重试" in msg or "流程卡住" in msg:
         return FAIL_STUCK
     if "sso_timeout" in low or "未获取到 sso" in msg or "未获取到 sso cookie" in msg:
@@ -2311,6 +2329,55 @@ def cloudmail_get_oai_code(
     )
 
 
+def get_icloud_api_base():
+    base = str(config.get("icloud_api_base", "") or "").strip().rstrip("/")
+    return base or icloud_provider.API_BASE_DEFAULT
+
+
+def icloud_key_for_email(email):
+    mapping = icloud_provider.email_key_map(
+        config.get("icloud_emails", ""),
+        config.get("icloud_code_keys", ""),
+    )
+    return icloud_provider.key_for_email(
+        email,
+        mapping,
+        config.get("icloud_email", ""),
+        config.get("icloud_code_key", ""),
+    )
+
+
+def icloud_get_email_and_token():
+    emails = icloud_provider.parse_emails(config.get("icloud_emails", ""))
+    if emails:
+        return icloud_provider.next_email(emails), "_"
+    single = icloud_provider.normalize_email(config.get("icloud_email", ""))
+    if not single:
+        raise Exception("请在配置里填 icloud_email 或 icloud_emails")
+    return single, "_"
+
+
+def icloud_get_oai_code(
+    email,
+    timeout=60,
+    poll_interval=3,
+    log_callback=None,
+    cancel_callback=None,
+):
+    return icloud_provider.wait_for_code(
+        http_get,
+        email,
+        icloud_key_for_email(email),
+        timeout=timeout,
+        poll_interval=poll_interval,
+        raise_if_cancelled=raise_if_cancelled,
+        sleep_with_cancel=sleep_with_cancel,
+        log_callback=log_callback,
+        cancel_callback=cancel_callback,
+        api_base=get_icloud_api_base(),
+    )
+
+
 def get_email_provider():
     return config.get("email_provider", "cloudflare")
 
@@ -2354,6 +2421,8 @@ def get_email_and_token(api_key=None):
                 ) from fallback_exc
     if provider == "mailnest":
         return mailnest_buy_email(), "_"
+    if provider == "icloud":
+        return icloud_get_email_and_token()
     return duckmail_provider.create_mailbox(
         http_get,
         http_post,
@@ -2415,6 +2484,14 @@ def get_oai_code(
         )
     if provider == "mailnest":
         return mailnest_get_code(
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
+    if provider == "icloud":
+        return icloud_get_oai_code(
             email,
             timeout=timeout,
             poll_interval=poll_interval,
@@ -2904,10 +2981,10 @@ def is_browser_low_traffic_mode() -> bool:
 
 
 def get_browser_traffic_savings_level() -> str:
-    value = str(config.get("browser_traffic_savings_level") or "more").strip().lower()
-    if value in {"standard", "less", "light"}:
-        return "standard"
-    return "more"
+    value = str(config.get("browser_traffic_savings_level") or "standard").strip().lower()
+    if value in {"more", "max"}:
+        return "more"
+    return "standard"
 
 
 def should_close_browser_after_run(user_stopped: bool) -> bool:

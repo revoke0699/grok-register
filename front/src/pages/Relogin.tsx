@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { CheckCircle2, History, ListChecks, Loader2, RefreshCcw, Search, ShieldAlert, X, XCircle } from "lucide-react";
+import { CheckCircle2, History, ListChecks, Loader2, RefreshCcw, Search, ShieldAlert, Square, TerminalSquare, Users, X, XCircle } from "lucide-react";
 import { AccountEmailLabel, EmailProviderIcon, EmailProviderLabel } from "@/components/AccountEmailIcon";
 import { AccountPageContext } from "@/components/AccountPageContext";
 import { AccountFilterBar, AccountSelectionToolbar } from "@/components/AccountTableToolbar";
+import { LiveLogBoard } from "@/components/LiveLogBoard";
 import { reloginSsoCheckLabel } from "@/components/ReloginReportDialog";
 import { Badge, Button, Card, EmptyState, Input, PageHeader, PaginationBar, Select, Toast } from "@/components/ui";
-import { api, type AccountRecord, type ReloginItem, type ReloginStatus } from "@/lib/api";
+import { api, type AccountRecord, type LogItem, type ReloginItem, type ReloginStatus } from "@/lib/api";
 import { appendReloginHistory } from "@/lib/reloginHistory";
 
 const RELOGIN_RESULT_PAGE_SIZE = 20;
@@ -62,6 +63,9 @@ function ReloginResultList({
             ) : null}
             {item.sso_check_error && item.sso_check_error !== item.error ? (
               <div className="mt-1 break-all text-xs text-amber-700">SSO 检查：{item.sso_check_error}</div>
+            ) : null}
+            {item.failure_type === "invalid_credentials" || /账号或密码错误|Wrong email address or password/i.test(item.error || item.visible_error || "") ? (
+              <div className="mt-1"><Badge variant="destructive">账号或密码错误，不是 SSO 异常</Badge></div>
             ) : null}
             {item.error ? <div className="mt-1 break-all text-xs text-red-700">{item.error}</div> : null}
             {item.status === "failed" && (item.stage || item.error_type || item.url) ? (
@@ -163,7 +167,14 @@ export function ReloginPage() {
   const [resultPage, setResultPage] = useState(1);
   const [resultsOpen, setResultsOpen] = useState(false);
   const [toast, setToast] = useState<{ message: string; tone?: "default" | "success" | "error" }>({ message: "" });
+  const [logs, setLogs] = useState<LogItem[]>([]);
+  const [activeTab, setActiveTab] = useState<"accounts" | "logs">("accounts");
+  const [stopping, setStopping] = useState(false);
   const recordedRun = useRef("");
+  const seenRunIdRef = useRef("");
+  const afterLogIdRef = useRef(0);
+  const logViewVersionRef = useRef(0);
+  const logPollingRef = useRef(false);
 
   const notify = (message: string, tone: "default" | "success" | "error" = "default") => {
     setToast({ message, tone });
@@ -197,24 +208,49 @@ export function ReloginPage() {
     return () => window.clearTimeout(timer);
   }, [query, riskFilter]);
 
+  const refreshReloginLogs = async () => {
+    if (logPollingRef.current) return null;
+    logPollingRef.current = true;
+    const viewVersion = logViewVersionRef.current;
+    try {
+      const data = await api.reloginLogs(afterLogIdRef.current, 500);
+      if (viewVersion !== logViewVersionRef.current) return data.relogin;
+      const next = data.relogin;
+      if (next.run_id && next.run_id !== seenRunIdRef.current) {
+        if (seenRunIdRef.current) setLogs([]);
+        seenRunIdRef.current = next.run_id;
+      }
+      setStatus(next);
+      const freshLogs = (data.logs || []).filter((item) => item.id > afterLogIdRef.current);
+      if (freshLogs.length) {
+        setLogs((prev) => [...prev, ...freshLogs].slice(-2000));
+        afterLogIdRef.current = freshLogs[freshLogs.length - 1].id;
+      }
+      return next;
+    } catch {
+      return null;
+    } finally {
+      logPollingRef.current = false;
+    }
+  };
+
   useEffect(() => {
     let active = true;
     let timer: number | undefined;
     const poll = async () => {
       try {
-        const result = await api.reloginStatus();
+        const next = await refreshReloginLogs();
         if (!active) return;
-        const next = result.relogin;
-        setStatus(next);
-        if (next.running) {
-          timer = window.setTimeout(poll, 1500);
+        if (next?.running) {
+          timer = window.setTimeout(poll, 1200);
           return;
         }
-        if (next.run_id && recordedRun.current !== next.run_id) {
+        if (next?.run_id && recordedRun.current !== next.run_id) {
           await appendReloginHistory(next);
           recordedRun.current = next.run_id;
           if (next.finished_at) void loadAccounts();
         }
+        timer = window.setTimeout(poll, 4000);
       } catch {
         if (active) timer = window.setTimeout(poll, 4000);
       }
@@ -251,6 +287,10 @@ export function ReloginPage() {
   }, [status?.run_id]);
 
   useEffect(() => {
+    if (status?.running) setActiveTab("logs");
+  }, [status?.running, status?.run_id]);
+
+  useEffect(() => {
     if (!resultsOpen) return;
     const previousOverflow = document.body.style.overflow;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -278,18 +318,39 @@ export function ReloginPage() {
 
   const start = async () => {
     if (!selectedIds.length || status?.running) return;
-    if (!window.confirm(`重新登录选中的 ${selectedIds.length} 个账号，刷新 SSO、检查风控并重建授权文件？`)) return;
+    if (!window.confirm(`重新登录选中的 ${selectedIds.length} 个账号，刷新 SSO 并重建授权文件？`)) return;
     setStarting(true);
     try {
       const result = await api.startBatchRelogin(selectedIds);
       recordedRun.current = "";
+      seenRunIdRef.current = result.relogin.run_id || "";
+      logViewVersionRef.current += 1;
+      afterLogIdRef.current = 0;
+      setLogs([]);
       setResultsOpen(false);
+      setActiveTab("logs");
+      setStopping(false);
       setStatus(result.relogin);
       notify("重新登录任务已启动", "success");
     } catch (error: any) {
       notify(error.message || "启动失败", "error");
     } finally {
       setStarting(false);
+    }
+  };
+
+  const stop = async () => {
+    if (!status?.running || stopping) return;
+    setStopping(true);
+    try {
+      const result = await api.stopRelogin();
+      setStatus(result.relogin);
+      setActiveTab("logs");
+      notify("已请求停止重新登录", "success");
+    } catch (error: any) {
+      notify(error.message || "停止失败", "error");
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -319,7 +380,7 @@ export function ReloginPage() {
       <AccountPageContext crumbs={[{ label: "重新登录" }]} />
       <PageHeader
         title="重新登录"
-        description="集中选择已有账号，刷新 SSO 后自动检查账号风控，再重建 CPA 与 Grok2API 授权文件。"
+        description="集中选择已有账号，按当前低流量设置刷新 SSO 后直接重建 CPA 与 Grok2API 授权文件。页面提示 Wrong email address or password 时记为账号密码错误，不再当成 SSO 超时。"
         actions={<>
           <Button variant="outline" disabled={!visibleResults.length} onClick={() => setResultsOpen(true)}>
             <ListChecks className="h-4 w-4" aria-hidden="true" />
@@ -338,15 +399,21 @@ export function ReloginPage() {
       {status?.running ? (
         <Card className="overflow-hidden border-sky-200">
           <div className="flex flex-col gap-4 p-4 sm:p-5">
-            <div className="flex items-start justify-between gap-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <div className="flex items-center gap-2 font-semibold text-slate-950">
                   <Loader2 className="h-4 w-4 animate-spin text-sky-600" aria-hidden="true" />
-                  正在重新登录
+                  {status.stopping ? "正在停止重新登录" : "正在重新登录"}
                 </div>
                 <p className="mt-1 text-xs text-slate-500">{status.stage} · {status.email || "准备账号"}</p>
               </div>
-              <Badge variant="default">{status.completed_count}/{status.total_count}</Badge>
+              <div className="flex items-center gap-2">
+                <Badge variant="default">{status.completed_count}/{status.total_count}</Badge>
+                <Button variant="destructive" size="sm" onClick={() => void stop()} disabled={stopping || !!status.stopping}>
+                  {stopping || status.stopping ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /> : <Square className="h-4 w-4" aria-hidden="true" />}
+                  停止任务
+                </Button>
+              </div>
             </div>
             <div className="h-2 overflow-hidden rounded-full bg-slate-100">
               <div className="h-full rounded-full bg-sky-500 transition-[width]" style={{ width: `${progress}%` }} />
@@ -365,7 +432,9 @@ export function ReloginPage() {
             </div>
           </div>
         </Card>
-      ) : status?.run_id && status.finished_at ? (
+      ) : null}
+
+      {status?.run_id && status.finished_at && !status.running ? (
         <Card className="p-4 sm:p-5">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div>
@@ -382,6 +451,54 @@ export function ReloginPage() {
         </Card>
       ) : null}
 
+      <div className="grid grid-cols-2 gap-1 rounded-xl bg-slate-100/80 p-1" role="tablist" aria-label="重新登录页面分类">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "accounts"}
+          onClick={() => setActiveTab("accounts")}
+          className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium transition ${activeTab === "accounts" ? "bg-white text-sky-700 shadow-sm ring-1 ring-sky-100" : "text-slate-500 hover:bg-white/70 hover:text-slate-700"}`}
+        >
+          <Users className="h-4 w-4" aria-hidden="true" />
+          账号
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === "logs"}
+          onClick={() => setActiveTab("logs")}
+          className={`flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium transition ${activeTab === "logs" ? "bg-white text-sky-700 shadow-sm ring-1 ring-sky-100" : "text-slate-500 hover:bg-white/70 hover:text-slate-700"}`}
+        >
+          <TerminalSquare className="h-4 w-4" aria-hidden="true" />
+          日志
+          {status?.running ? <Badge variant="default">运行中</Badge> : logs.length ? <Badge variant="secondary">{logs.length}</Badge> : null}
+        </button>
+      </div>
+
+      <div className={activeTab === "logs" ? "" : "hidden"} role="tabpanel" aria-label="重新登录日志">
+        <LiveLogBoard
+          logs={logs}
+          running={!!status?.running}
+          lastError={status?.error}
+          title="重新登录日志"
+          description="按时间顺序显示浏览器登录、Turnstile 和授权重建日志。"
+          ariaLabel="实时重新登录日志"
+          emptyIdleHint="等待日志…选择账号并启动重新登录后会在这里实时输出。"
+          emptyRunningHint="重新登录进行中，正在等待实时日志…"
+          statusRunningLabel="日志持续同步中"
+          statusIdleLabel={status?.run_id ? "最近一次任务日志" : "等待新任务"}
+          extraMeta={status?.total_count ? `完成 ${status.completed_count}/${status.total_count}` : undefined}
+          onClearView={() => {
+            const latestId = Math.max(afterLogIdRef.current, Number(status?.latest_log_id || 0));
+            logViewVersionRef.current += 1;
+            afterLogIdRef.current = latestId;
+            setLogs([]);
+          }}
+          onToast={notify}
+        />
+      </div>
+
+      <div className={activeTab === "accounts" ? "" : "hidden"} role="tabpanel" aria-label="重新登录账号">
       <Card className="overflow-hidden">
         <AccountFilterBar>
             <div className="w-full sm:w-48">
@@ -497,6 +614,7 @@ export function ReloginPage() {
           />
         ) : null}
       </Card>
+      </div>
 
       {resultsOpen && status && visibleResults.length ? <ReloginResultsDrawer status={status} items={pagedResults} page={safeResultPage} botRiskByAccountId={botRiskByAccountId} onPageChange={setResultPage} onClose={() => setResultsOpen(false)} /> : null}
       <Toast message={toast.message} tone={toast.tone} />

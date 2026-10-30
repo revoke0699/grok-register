@@ -87,13 +87,17 @@ class ProxyConfigUpdateTests(unittest.TestCase):
         self.assertIs(result["config"]["browser_low_traffic_mode"], True)
         save.assert_called_once_with()
 
-    def test_traffic_savings_level_accepts_standard_and_falls_back_to_more(self):
+    def test_traffic_savings_level_accepts_more_and_falls_back_to_standard(self):
         with patch.object(gr, "load_config"), patch.object(gr, "save_config"):
-            selected = _apply_config_updates({"browser_traffic_savings_level": "standard"})
+            selected = _apply_config_updates({"browser_traffic_savings_level": "more"})
             fallback = _apply_config_updates({"browser_traffic_savings_level": "unknown"})
 
-        self.assertEqual(selected["config"]["browser_traffic_savings_level"], "standard")
-        self.assertEqual(fallback["config"]["browser_traffic_savings_level"], "more")
+        self.assertEqual(selected["config"]["browser_traffic_savings_level"], "more")
+        self.assertEqual(fallback["config"]["browser_traffic_savings_level"], "standard")
+
+        with patch.object(gr, "load_config"), patch.object(gr, "save_config"):
+            aliases = _apply_config_updates({"browser_traffic_savings_level": "max"})
+        self.assertEqual(aliases["config"]["browser_traffic_savings_level"], "more")
 
     def test_code_timeout_group_id_defaults_to_blank(self):
         self.assertEqual(gr.DEFAULT_CONFIG["outlookemail_code_timeout_group_id"], "")
@@ -103,12 +107,12 @@ class ProxyConfigUpdateTests(unittest.TestCase):
         paths = {getattr(route, "path", "") for route in app.routes}
         self.assertIn("/api/outlookemail/groups", paths)
 
-    def test_missing_traffic_savings_level_defaults_to_more(self):
-        self.assertEqual(gr.DEFAULT_CONFIG["browser_traffic_savings_level"], "more")
+    def test_missing_traffic_savings_level_defaults_to_standard(self):
+        self.assertEqual(gr.DEFAULT_CONFIG["browser_traffic_savings_level"], "standard")
         original = gr.config.get("browser_traffic_savings_level", "missing")
         try:
             gr.config.pop("browser_traffic_savings_level", None)
-            self.assertEqual(gr.get_browser_traffic_savings_level(), "more")
+            self.assertEqual(gr.get_browser_traffic_savings_level(), "standard")
         finally:
             if original == "missing":
                 gr.config.pop("browser_traffic_savings_level", None)

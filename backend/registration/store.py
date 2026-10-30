@@ -575,7 +575,7 @@ class RegistrationRepository:
                     success = 1
                     OR sso_saved = 1
                     OR lower(coalesce(failure_type, '')) IN (
-                        'already_registered', 'registration_risk', 'sso_timeout'
+                        'already_registered', 'registration_risk', 'sso_timeout', 'invalid_credentials'
                     )
                     OR lower(coalesce(email_disable_status, '')) IN ('success', 'failed')
                   )
@@ -613,8 +613,12 @@ class RegistrationRepository:
             "CASE WHEN json_valid(extra_json) THEN extra_json ELSE '{}' END"
         )
         grokiq_degraded_sql = (
+            "("
             f"COALESCE(json_extract({extra_json_sql}, '$.grokiq_result.degraded') "
-            "IN (1, '1', 'true', 'True'), 0) = 1"
+            "IN (1, '1', 'true', 'True'), 0) = 1 OR "
+            f"lower(COALESCE(json_extract({extra_json_sql}, '$.grokiq_result.verdict'), '')) "
+            "IN ('degraded', 'quarantined')"
+            ")"
         )
         if normalized_bot_risk in {"1", "true", "yes", "risk", "bot", "bot_risk"}:
             clauses.append(
@@ -622,6 +626,8 @@ class RegistrationRepository:
                 "(trim(COALESCE(bfs, '')) <> '' AND trim(COALESCE(bfs, '')) <> '0') OR "
                 f"{grokiq_degraded_sql})"
             )
+        elif normalized_bot_risk in {"grokiq", "degraded", "grokiq_degraded"}:
+            clauses.append(grokiq_degraded_sql)
         elif normalized_bot_risk in {"0", "false", "no", "normal", "safe"}:
             clauses.append(
                 "COALESCE(bot_risk, 0) = 0 AND "
@@ -1245,8 +1251,12 @@ class RegistrationRepository:
                 SET bot_risk = 1
                 WHERE COALESCE(bot_risk, 0) = 0
                   AND json_valid(extra_json)
-                  AND json_extract(extra_json, '$.grokiq_result.degraded')
-                      IN (1, '1', 'true', 'True')
+                  AND (
+                    json_extract(extra_json, '$.grokiq_result.degraded')
+                        IN (1, '1', 'true', 'True')
+                    OR lower(COALESCE(json_extract(extra_json, '$.grokiq_result.verdict'), ''))
+                        IN ('degraded', 'quarantined')
+                  )
                 """
             )
             return int(cursor.rowcount or 0)
