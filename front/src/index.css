@@ -118,6 +118,11 @@ input[type="checkbox"] {
   }
 }
 
+.secret-input {
+  -webkit-text-security: disc;
+  text-security: disc;
+}
+
 @media (prefers-reduced-motion: reduce) {
   html {
     scroll-behavior: auto;

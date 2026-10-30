@@ -29,6 +29,7 @@ import {
   PageHeader,
   Select,
   Switch,
+  Textarea,
   Toast,
 } from "@/components/ui";
 
@@ -66,7 +67,7 @@ const PROVIDERS = [
   {
     value: "icloud",
     label: "iCloud 邮箱（Veilimage）",
-    description: "使用事先配置好的 iCloud 邮箱，通过 Veilimage 取验证码，不是现场生成邮箱。",
+    description: "粘贴基础邮箱和完整取码地址。分裂数量会给每个邮箱生成别名，验证码仍走原邮箱的取码地址。",
   },
 ];
 // cpa / grok2api 保留类型仅为兼容；路由已重定向到 tokenauth
@@ -484,6 +485,168 @@ function OutlookGroupSelect({
         ))}
       </Select>
       {helper ? <p className="text-xs leading-5 text-muted-foreground">{helper}</p> : null}
+    </div>
+  );
+}
+
+const ICLOUD_SPLIT_COUNT_ERROR = "分裂数量必须是大于等于 0 的整数，不能为负数或小数";
+
+function readIcloudSplitCount(value: unknown): { count: number } | { error: string } {
+  if (value === undefined) return { count: 0 };
+  if (typeof value === "boolean" || value === null) return { error: ICLOUD_SPLIT_COUNT_ERROR };
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || !Number.isInteger(value) || value < 0) return { error: ICLOUD_SPLIT_COUNT_ERROR };
+    return { count: value };
+  }
+  const text = String(value).trim();
+  if (!/^[0-9]+$/.test(text)) return { error: ICLOUD_SPLIT_COUNT_ERROR };
+  return { count: Number(text) };
+}
+
+function icloudUrlError(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return "右边必须是 http(s) 完整取码地址";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return "右边必须是 http(s) 完整取码地址";
+  }
+  const path = parsed.pathname.replace(/\/+$/, "");
+  if (!path.toLowerCase().endsWith("/api/v1/code")) {
+    return "右边的路径必须以 /api/v1/code 结尾";
+  }
+  const key = parsed.searchParams.get("key");
+  if (!key || !key.trim()) {
+    return "右边必须包含 ?key= 后面的整串 code_key";
+  }
+  return "";
+}
+
+function summarizeIcloudEntries(text: string): { baseCount: number; errors: string[] } {
+  const errors: string[] = [];
+  let baseCount = 0;
+  String(text || "").split(/\r\n|\n|\r/).forEach((raw, index) => {
+    const line = raw.trim();
+    if (!line) return;
+    const lineNo = index + 1;
+    const splitAt = line.indexOf("----");
+    if (splitAt < 0) {
+      errors.push(`第 ${lineNo} 行: 应为“邮箱----接口地址”`);
+      return;
+    }
+    const email = line.slice(0, splitAt).replace(/\s+/g, "").toLowerCase();
+    const url = line.slice(splitAt + 4).trim();
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+      errors.push(`第 ${lineNo} 行: 左边必须是带 @ 的邮箱地址`);
+      return;
+    }
+    const urlError = icloudUrlError(url);
+    if (urlError) {
+      errors.push(`第 ${lineNo} 行: ${urlError}`);
+      return;
+    }
+    baseCount += 1;
+  });
+  return { baseCount, errors };
+}
+
+function legacyIcloudBaseCount(config: Record<string, any>): number {
+  const many = String(config.icloud_emails || "")
+    .split(/[,，]/)
+    .map((item) => item.replace(/\s+/g, ""))
+    .filter(Boolean);
+  if (many.length) return many.length;
+  return String(config.icloud_email || "").replace(/\s+/g, "") ? 1 : 0;
+}
+
+function SecretTextarea({
+  config,
+  onFieldChange,
+  label,
+  field,
+  placeholder = "",
+  helper = "",
+}: {
+  config: Record<string, any>;
+  onFieldChange: (key: string, value: any) => void;
+  label: string;
+  field: string;
+  placeholder?: string;
+  helper?: string;
+}) {
+  const [showSecret, setShowSecret] = useState(false);
+  return (
+    <div className="min-w-0 space-y-2 sm:col-span-2">
+      <Label htmlFor={field}>{label}</Label>
+      <div className="relative">
+        <Textarea
+          id={field}
+          rows={8}
+          autoComplete="new-password"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          className={`min-h-40 pr-10 font-mono text-xs leading-5 ${showSecret ? "" : "secret-input"}`}
+          placeholder={placeholder}
+          value={config[field] ?? ""}
+          onChange={(event) => onFieldChange(field, event.target.value)}
+        />
+        <button
+          type="button"
+          className="absolute right-0 top-0 flex h-10 w-10 items-center justify-center text-muted-foreground transition hover:text-foreground"
+          aria-label={showSecret ? `隐藏${label}` : `显示${label}`}
+          aria-pressed={showSecret}
+          onClick={() => setShowSecret((value) => !value)}
+        >
+          {showSecret ? <EyeOff className="h-4 w-4" aria-hidden="true" /> : <Eye className="h-4 w-4" aria-hidden="true" />}
+        </button>
+      </div>
+      {helper ? <p className="text-xs leading-5 text-muted-foreground">{helper}</p> : null}
+    </div>
+  );
+}
+
+function IcloudEntrySummary({ config }: { config: Record<string, any> }) {
+  const raw = String(config.icloud_entries || "");
+  const usingEntries = raw.trim().length > 0;
+  const parsed = usingEntries
+    ? summarizeIcloudEntries(raw)
+    : { baseCount: legacyIcloudBaseCount(config), errors: [] as string[] };
+  const split = readIcloudSplitCount(config.icloud_split_count);
+  const lineErrors = parsed.errors;
+  const splitCount = "count" in split ? split.count : null;
+  const totalText =
+    splitCount === null || lineErrors.length > 0
+      ? ""
+      : `${parsed.baseCount} + ${parsed.baseCount} × ${splitCount} = ${parsed.baseCount + parsed.baseCount * splitCount}`;
+  return (
+    <div className="space-y-1 rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs leading-5 text-slate-600 sm:col-span-2">
+      <div className="font-medium text-slate-800">解析结果</div>
+      {usingEntries ? (
+        <p>
+          以原始列表为准。基础邮箱 {parsed.baseCount} 个。
+          {lineErrors.length ? " 有格式错误的行不会被静默丢掉，展开总数先不计算。" : ""}
+        </p>
+      ) : (
+        <p>
+          {parsed.baseCount > 0
+            ? `原始列表为空，沿用已保存的旧配置，基础邮箱 ${parsed.baseCount} 个。填写原始列表后以原始列表为准。`
+            : "原始列表为空，也没有可用的旧邮箱配置。基础邮箱 0 个。"}
+        </p>
+      )}
+      {"error" in split ? (
+        <p className="text-red-700">{split.error}</p>
+      ) : (
+        <p>分裂数量 {split.count}。每个基础邮箱各生成 {split.count} 个别名，基础邮箱本身也会注册。</p>
+      )}
+      {totalText ? <p>展开后总邮箱数 {totalText}。</p> : null}
+      {lineErrors.length ? (
+        <p className="whitespace-pre-wrap text-red-700">
+          {`iCloud 邮箱列表格式错误:\n${lineErrors.join("\n")}\n这些行不会被丢弃，保存和注册都会按行号报错。`}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -1191,23 +1354,27 @@ export function SettingsPage({ section = "registration" }: { section?: SettingsS
 
             {selectedProvider.value === "icloud" ? (
               <>
-                <ConfigField {...fieldState} label="接口地址" field="icloud_api_base" helper="Veilimage 取码接口根地址，默认 https://mail.veilimage.com" />
-                <ConfigField {...fieldState} label="iCloud 邮箱" field="icloud_email" helper="单个已配置的 iCloud 邮箱。填写了下方邮箱列表时，注册会优先轮询列表" />
                 <ConfigField
                   {...fieldState}
-                  label="code_key"
-                  field="icloud_code_key"
-                  type="password"
-                  helper="Veilimage 取码链接里 ?key= 后面的整串。形如 mail_<urlencoded邮箱>_<十六进制后缀>。如果只填了十六进制后缀，会按当前邮箱补成整串"
+                  label="接口地址"
+                  field="icloud_api_base"
+                  helper="默认 https://mail.veilimage.com，只作为旧配置的根地址参考，不覆盖每行自带的完整接口地址"
                 />
-                <ConfigField {...fieldState} label="多个 iCloud 邮箱" field="icloud_emails" helper="可选，逗号分隔多个已配置邮箱，注册时按顺序轮流使用" />
                 <ConfigField
                   {...fieldState}
-                  label="多个 code_key"
-                  field="icloud_code_keys"
-                  type="password"
-                  helper="可选，逗号分隔，与上面的邮箱按顺序一一对应。每项都是 ?key= 后面的整串；只填十六进制后缀时按对应邮箱补全"
+                  label="分裂数量"
+                  field="icloud_split_count"
+                  type="number"
+                  helper="每个基础邮箱各生成这么多个别名。0 表示不生成。必须是大于等于 0 的整数，负数或小数会报错，不会当成 0"
                 />
+                <SecretTextarea
+                  {...fieldState}
+                  label="原始 iCloud 邮箱列表"
+                  field="icloud_entries"
+                  placeholder={"fixture@example.com----https://example.com/api/v1/code?key=test-key"}
+                  helper="每行一条：邮箱----接口地址。左边是带 @ 的基础邮箱，右边是该邮箱的完整取码 URL，必须包含 ?key= 整串。空行跳过，格式不对会按行号报错。分裂数量是每个邮箱各生成几个别名；原邮箱也参与注册；别名取码走原邮箱的接口地址，key 不变。本列表非空时以它为准，留空才使用已保存的旧邮箱和 code_key。列表里含完整 key，默认不明文显示。"
+                />
+                <IcloudEntrySummary config={config} />
               </>
             ) : null}
 

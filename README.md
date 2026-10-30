@@ -24,7 +24,7 @@
 - Web 控制台：任务进度、实时日志、账号管理和系统设置
 - Camoufox（Firefox，默认）与 CloakBrowser（Chromium）双浏览器后端，共用注册流程、代理和异常进程清理
 - 支持 Cloudflare、DuckMail / Mail.tm、YYDS、MailNest、OutlookEmail、CloudMail、iCloud
-- iCloud 使用事先在 Veilimage 配好的邮箱，不现场生成。取码为 `GET {icloud_api_base}/api/v1/code?key={code_key}`，`icloud_api_base` 默认 `https://mail.veilimage.com`。`code_key` 填写取码链接里 `?key=` 后面的整串，形如 `mail_`、URL 编码后的邮箱、`_` 和十六进制后缀。配置里如果只写了十六进制后缀，会按当前邮箱补成整串。多个邮箱和多个 code_key 用逗号分隔，并按顺序一一对应
+- iCloud 使用事先在 Veilimage 配好的邮箱，不现场生成。主配置是 `icloud_entries`，每行 `邮箱----完整取码 URL`，例如 `fixture@example.com----https://example.com/api/v1/code?key=test-key`。URL 必须带 `?key=` 整串；取码时按注册邮箱找到这一行的原始 URL，再从中解析 `code_key`，不会用别名邮箱重新拼 key。`icloud_api_base` 默认 `https://mail.veilimage.com`，只作为旧配置的根地址参考，不覆盖每行自带的完整接口地址。`icloud_split_count` 默认 `0`，表示每个基础邮箱各自生成几个别名；基础邮箱本身也按原顺序参与注册，展开顺序是 `[基础邮箱, 别名1, …, 别名N]`。别名在 `@` 前插入随机 `+` 后缀，取码地址仍是该基础邮箱的那条 URL。`icloud_entries` 非空时以它为准。只有它为空时，才回退到旧的 `icloud_email` / `icloud_code_key`，或按位置配对的逗号列表 `icloud_emails` / `icloud_code_keys`。旧字段里如果只写了十六进制后缀，仍按对应基础邮箱补成 `mail_<urlencoded邮箱>_<后缀>`
 - 注册完成后生成 CPA / Grok2API JSON
 - 上游已不再下发 `bfs`，本项目不能判断账号是否风控；必须联动 [GrokIQ](https://github.com/kaibush/grok-iq) 做账号级降智检测和自动隔离
 - Grok Build 导入成功后通过持久 Webhook 通知 GrokIQ，由 GrokIQ 自动探针并隔离异常账号

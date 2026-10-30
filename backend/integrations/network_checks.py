@@ -11,6 +11,7 @@ from typing import Callable, List, Tuple
 from urllib.parse import urlparse
 
 from backend.mailbox import cloudflare_worker as cloudflare_provider
+from backend.mailbox import icloud_mail as icloud_provider
 from backend.integrations.proxy import redact_proxy_text, resolve_proxy_url
 from backend.shared.paths import resolve_project_path
 
@@ -143,13 +144,6 @@ def check_xai_signup(proxy_url: str, http_get: Callable) -> CheckResult:
 
 def has_blocking_xai_failure(results: List[CheckResult]) -> bool:
     return any(name == XAI_SIGNUP_CHECK_NAME and not ok for name, ok, _ in results)
-
-
-def _icloud_config_present(value) -> bool:
-    text = str(value or "").strip()
-    if not text:
-        return False
-    return any(part.strip() for part in text.replace("，", ",").split(","))
 
 
 def check_email_api(provider: str, config: dict, http_get: Callable, http_post: Callable) -> CheckResult:
@@ -303,16 +297,12 @@ def check_email_api(provider: str, config: dict, http_get: Callable, http_post: 
             return "邮箱API", resp.status_code < 400, f"CloudMail HTTP {resp.status_code}"
 
         if provider == "icloud":
-            # 取码接口返回的是最新验证码。探活只检查配置是否齐，不真正请求，
-            # 避免把已经到达的验证码取走。
-            has_email = _icloud_config_present(config.get("icloud_email")) or _icloud_config_present(
-                config.get("icloud_emails")
-            )
-            has_key = _icloud_config_present(config.get("icloud_code_key")) or _icloud_config_present(
-                config.get("icloud_code_keys")
-            )
-            if not has_email or not has_key:
-                return "邮箱API", False, "iCloud 需同时配置邮箱和 code_key"
+            # 取码接口返回的是最新验证码。探活只检查列表、行格式和分裂数量，
+            # 不生成别名，也不真正请求，避免把已经到达的验证码取走。
+            try:
+                icloud_provider.base_entries_from_config(config)
+            except Exception as exc:
+                return "邮箱API", False, str(exc)
             return "邮箱API", True, "已配置，探活不实际取码"
 
         return "邮箱API", True, f"提供商 {provider} 跳过深度探测"

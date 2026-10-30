@@ -394,6 +394,9 @@ DEFAULT_CONFIG = {
     "icloud_code_key": "",
     "icloud_emails": "",
     "icloud_code_keys": "",
+    # 原始列表非空时以它为准；为空才回退上面的旧字段
+    "icloud_entries": "",
+    "icloud_split_count": 0,
     # 账号间注册间隔（秒），0=不等待。填一个整数=N秒固定等待，填区间"60-120"=随机等待
     "account_interval": "60-120",
 }
@@ -2329,32 +2332,82 @@ def cloudmail_get_oai_code(
     )
 
 
+_icloud_pool_lock = threading.Lock()
+_icloud_pool_signature = None
+_icloud_pool_pairs = None
+
+
 def get_icloud_api_base():
+    """旧配置没有完整 URL 时使用的根地址。
+
+    不覆盖 icloud_entries 每一行自带的取码地址。
+    """
     base = str(config.get("icloud_api_base", "") or "").strip().rstrip("/")
     return base or icloud_provider.API_BASE_DEFAULT
 
 
+def _icloud_pool_key():
+    entries_text = str(config.get("icloud_entries", "") or "")
+    split_text = str(config.get("icloud_split_count", 0))
+    if entries_text.strip():
+        return ("entries", entries_text, split_text)
+    return (
+        "legacy",
+        str(config.get("icloud_emails", "") or ""),
+        str(config.get("icloud_code_keys", "") or ""),
+        str(config.get("icloud_email", "") or ""),
+        str(config.get("icloud_code_key", "") or ""),
+        str(config.get("icloud_api_base", "") or ""),
+        split_text,
+    )
+
+
+def icloud_registration_pairs():
+    """按当前配置展开邮箱，并缓存这一次的别名。
+
+    别名是随机的。取邮箱和随后取码必须看到同一份列表，
+    所以配置没变时不重新生成。
+    """
+    global _icloud_pool_signature, _icloud_pool_pairs
+    signature = _icloud_pool_key()
+    with _icloud_pool_lock:
+        if _icloud_pool_pairs is not None and _icloud_pool_signature == signature:
+            return list(_icloud_pool_pairs)
+        bases = icloud_provider.base_entries_from_config(config)
+        split_count = icloud_provider.configured_split_count(config)
+        pairs = icloud_provider.expand_icloud_entries(bases, split_count)
+        _icloud_pool_signature = signature
+        _icloud_pool_pairs = list(pairs)
+        icloud_provider.reset_next_email()
+        return list(pairs)
+
+
+def icloud_endpoint_for_email(email):
+    """按注册邮箱找原始取码地址，再拆出 api_base 和 code_key。"""
+    normalized = icloud_provider.normalize_email(email)
+    if not normalized:
+        raise Exception("iCloud 取码缺少邮箱，无法匹配 code_key")
+    for item_email, api_url in icloud_registration_pairs():
+        if item_email == normalized:
+            return icloud_provider.split_code_api_url(api_url)
+    raise Exception(
+        f"未找到邮箱 {normalized} 的 iCloud 取码地址。"
+        "请确认该邮箱来自 icloud_entries 的展开结果；"
+        "列表为空时才使用 icloud_email / icloud_emails"
+    )
+
+
 def icloud_key_for_email(email):
-    mapping = icloud_provider.email_key_map(
-        config.get("icloud_emails", ""),
-        config.get("icloud_code_keys", ""),
-    )
-    return icloud_provider.key_for_email(
-        email,
-        mapping,
-        config.get("icloud_email", ""),
-        config.get("icloud_code_key", ""),
-    )
+    _api_base, code_key = icloud_endpoint_for_email(email)
+    return code_key
 
 
 def icloud_get_email_and_token():
-    emails = icloud_provider.parse_emails(config.get("icloud_emails", ""))
-    if emails:
-        return icloud_provider.next_email(emails), "_"
-    single = icloud_provider.normalize_email(config.get("icloud_email", ""))
-    if not single:
+    pairs = icloud_registration_pairs()
+    emails = [email for email, _api_url in pairs]
+    if not emails:
         raise Exception("请在配置里填 icloud_email 或 icloud_emails")
-    return single, "_"
+    return icloud_provider.next_email(emails), "_"
 
 
 def icloud_get_oai_code(
@@ -2364,17 +2417,18 @@ def icloud_get_oai_code(
     log_callback=None,
     cancel_callback=None,
 ):
+    api_base, code_key = icloud_endpoint_for_email(email)
     return icloud_provider.wait_for_code(
         http_get,
         email,
-        icloud_key_for_email(email),
+        code_key,
         timeout=timeout,
         poll_interval=poll_interval,
         raise_if_cancelled=raise_if_cancelled,
         sleep_with_cancel=sleep_with_cancel,
         log_callback=log_callback,
         cancel_callback=cancel_callback,
-        api_base=get_icloud_api_base(),
+        api_base=api_base,
     )
 
 

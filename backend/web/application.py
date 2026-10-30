@@ -31,6 +31,7 @@ from .sso_check_jobs import sso_check_coordinator
 from .update_check import ReleaseUpdateService
 from backend.integrations.proxy import validate_http_proxy_url
 from backend.integrations import grokiq
+from backend.mailbox import icloud_mail as icloud_provider
 from backend.shared.paths import DATA_ROOT, PROJECT_ROOT, STATIC_ROOT
 from backend.shared.version import current_version
 
@@ -122,6 +123,8 @@ CONFIG_PUBLIC_KEYS = (
     "icloud_code_key",
     "icloud_emails",
     "icloud_code_keys",
+    "icloud_entries",
+    "icloud_split_count",
     "account_interval",
 )
 
@@ -142,6 +145,7 @@ SENSITIVE_HINT_KEYS = {
     "yyds_jwt",
     "icloud_code_key",
     "icloud_code_keys",
+    "icloud_entries",
     "proxy",
 }
 
@@ -479,6 +483,24 @@ def _apply_config_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
                     if item.isdigit():
                         cleaned.append(item)
             value = ",".join(cleaned)
+        elif key == "icloud_split_count":
+            try:
+                value = icloud_provider.parse_split_count(value)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        elif key == "icloud_entries":
+            if isinstance(value, (dict, list, int, float, bool)):
+                raise HTTPException(status_code=400, detail="icloud_entries 必须是多行文本")
+            text = str(value if value is not None else "")
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            if not text.strip():
+                value = ""
+            else:
+                try:
+                    icloud_provider.parse_icloud_entries(text)
+                except Exception as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                value = text
         else:
             if isinstance(value, (dict, list)):
                 continue

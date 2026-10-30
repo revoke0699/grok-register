@@ -77,5 +77,7 @@
   "icloud_email": "",
   "icloud_code_key": "",
   "icloud_emails": "",
-  "icloud_code_keys": ""
+  "icloud_code_keys": "",
+  "icloud_entries": "fixture@example.com----https://example.com/api/v1/code?key=test-key",
+  "icloud_split_count": 0
 }
