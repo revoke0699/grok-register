@@ -538,6 +538,7 @@ FAIL_DOMAIN = "domain_rejected"
 FAIL_ALREADY_REGISTERED = "already_registered"
 FAIL_RISK = "registration_risk"
 FAIL_CODE = "code_timeout"
+FAIL_CODE_FILL = "code_fill_failed"
 FAIL_BROWSER = "browser"
 FAIL_CPA = "cpa"
 FAIL_STUCK = "stuck_retry"
@@ -550,6 +551,7 @@ FAIL_LABELS = {
     FAIL_ALREADY_REGISTERED: "账号已注册",
     FAIL_RISK: "注册风控",
     FAIL_CODE: "验证码超时",
+    FAIL_CODE_FILL: "验证码填写失败",
     FAIL_BROWSER: "浏览器断开",
     FAIL_CPA: "CPA失败",
     FAIL_STUCK: "流程卡住",
@@ -581,6 +583,9 @@ def classify_failure(exc) -> str:
         return FAIL_STUCK
     if "sso_timeout" in low or "未获取到 sso" in msg or "未获取到 sso cookie" in msg:
         return FAIL_SSO
+    # 码已经拿到，失败发生在自动填写或提交。不要再归进验证码超时。
+    if "验证码已获取，但自动填写/提交失败" in msg:
+        return FAIL_CODE_FILL
     if "未收到验证码" in msg or "验证码阶段失败" in msg or "验证码" in msg and "失败" in msg:
         return FAIL_CODE
     if (
@@ -3617,7 +3622,11 @@ def run_registration(count):
                         break
                     except Exception as mail_exc:
                         msg = str(mail_exc)
-                        if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
+                        if (
+                            "验证码已获取，但自动填写/提交失败" not in msg
+                            and ("未收到验证码" in msg or "验证码" in msg)
+                            and mail_try < max_mail_retry
+                        ):
                             _persist_result(
                                 started_at=mail_attempt_started_at,
                                 email=email,

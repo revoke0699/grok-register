@@ -899,6 +899,128 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
     return False
 
 
+def _controls_suffix(controls) -> str:
+    if not isinstance(controls, dict) or not controls:
+        return ""
+    inputs = controls.get("inputs") or []
+    buttons = controls.get("buttons") or []
+    if isinstance(inputs, list):
+        inputs = " | ".join(str(item) for item in inputs[:6] if str(item or "").strip())
+    if isinstance(buttons, list):
+        buttons = " | ".join(str(item) for item in buttons[:8] if str(item or "").strip())
+    url = controls.get("url") or (page.url if page else "")
+    return f"url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
+
+
+def _email_submit_controls() -> dict:
+    """看邮箱框和主按钮。disabled / aria-disabled 的主按钮仍算存在，记为 loading。
+
+    转圈中的按钮如果被滤成 none，后面会误报成没找到输入框或按钮。
+    """
+    try:
+        result = page.run_js(
+            r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+    return [
+        node.innerText,
+        node.textContent,
+        node.getAttribute('aria-label'),
+        node.getAttribute('title'),
+        node.getAttribute('placeholder'),
+        node.getAttribute('data-testid'),
+        node.getAttribute('name'),
+        node.getAttribute('id'),
+        node.getAttribute('value'),
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function emailCandidates() {
+    const direct = Array.from(document.querySelectorAll('input[data-testid="email"], input[name="email"], input[type="email"], input[autocomplete="email"], input[placeholder*="mail" i], input[aria-label*="mail" i]'));
+    const all = Array.from(document.querySelectorAll('input, textarea'));
+    for (const node of all) {
+        const type = (node.getAttribute('type') || '').toLowerCase();
+        if (['hidden', 'submit', 'button', 'checkbox', 'radio', 'file', 'search'].includes(type)) continue;
+        const meta = textOf(node).toLowerCase();
+        if (meta.includes('email') || meta.includes('e-mail') || meta.includes('mail') || meta.includes('邮箱') || meta.includes('电子邮件')) {
+            direct.push(node);
+        }
+    }
+    return Array.from(new Set(direct));
+}
+function isLoading(node) {
+    if (!node) return false;
+    if (node.disabled) return true;
+    if ((node.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return true;
+    if ((node.getAttribute('aria-busy') || '').toLowerCase() === 'true') return true;
+    return false;
+}
+function isMainButton(node) {
+    const type = (node.getAttribute('type') || '').toLowerCase();
+    const testid = (node.getAttribute('data-testid') || '').toLowerCase();
+    if (type === 'submit') return true;
+    if (testid.includes('submit') || testid.includes('signup') || testid.includes('continue') || testid.includes('register')) return true;
+    const compact = textOf(node).replace(/\s+/g, '');
+    const lower = compact.toLowerCase();
+    return (
+        compact.includes('注册') || compact.includes('继续') || compact.includes('下一步') || compact.includes('确认') ||
+        lower.includes('signup') || lower.includes('continue') || lower.includes('next') ||
+        lower.includes('createaccount') || lower.includes('submit') || lower.includes('registr') ||
+        lower.includes('inscr') || compact.includes('登録')
+    );
+}
+const emailInput = emailCandidates().find((node) => isVisible(node)) || null;
+const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a')).filter(isVisible);
+const describedButtons = buttons.map((node) => {
+    const label = textOf(node).slice(0, 120);
+    return isLoading(node) ? `[loading] ${label}`.trim() : label;
+}).filter(Boolean).slice(0, 8);
+const describedInputs = Array.from(document.querySelectorAll('input, textarea')).filter((node) => {
+    if (!isVisible(node)) return false;
+    const type = (node.getAttribute('type') || '').toLowerCase();
+    return !['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(type);
+}).slice(0, 8).map((node) => {
+    const locked = node.disabled || node.readOnly;
+    const label = [
+        `type=${node.getAttribute('type') || ''}`,
+        `name=${node.getAttribute('name') || ''}`,
+        `id=${node.getAttribute('id') || ''}`,
+        `placeholder=${node.getAttribute('placeholder') || ''}`,
+    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    return locked ? `[locked] ${label}` : label;
+});
+let submit = 'missing';
+const enabledMain = buttons.find((node) => isMainButton(node) && !isLoading(node));
+const loadingMain = buttons.find((node) => isMainButton(node) && isLoading(node));
+if (enabledMain) submit = 'enabled';
+else if (loadingMain) submit = 'loading';
+else if (emailInput) {
+    const form = emailInput.closest('form');
+    const scoped = form
+        ? Array.from(form.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(isVisible)
+        : [];
+    if (scoped.length > 0 && scoped.every(isLoading)) submit = 'loading';
+}
+return {
+    url: location.href,
+    email_input: !!emailInput,
+    email_ready: !!(emailInput && !emailInput.disabled && !emailInput.readOnly),
+    submit,
+    inputs: describedInputs,
+    buttons: describedButtons,
+};
+            """
+        )
+    except Exception:
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     raise_if_cancelled(cancel_callback)
     _runtime.last_email = ""
@@ -929,12 +1051,25 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
         raise Exception("连续获取到已注册/已消耗邮箱，已达到更换上限；这不是邮箱池为空，请补充新邮箱或停用已占用账号")
     if log_callback:
         log_callback(f"[*] 已创建邮箱: {email}")
-    deadline = time.time() + timeout
+    # 点注册方式后页面没跳到邮箱框，和邮箱已填后主按钮还在转圈，分开计时。
+    # 两段都用本步骤的 timeout，不改默认值。等按钮从“邮箱已填且主按钮
+    # disabled/loading”起算，不占用前面等跳转已经花掉的时间，也不会无限等。
+    navigation_deadline = time.time() + timeout
+    button_wait_deadline = None
+    loop_deadline = navigation_deadline
+    saw_email_input = False
     last_diag_time = 0
     last_reclick_time = 0
     last_snapshot = None
     last_submit_clicked_at = None
-    while time.time() < deadline:
+
+    def _begin_button_wait():
+        nonlocal button_wait_deadline, loop_deadline
+        if button_wait_deadline is None:
+            button_wait_deadline = time.time() + timeout
+            loop_deadline = max(loop_deadline, button_wait_deadline)
+
+    while time.time() < loop_deadline:
         raise_if_cancelled(cancel_callback)
         # 邮箱提交后的跳转有时超过 _wait_email_page_advanced 的短确认窗口。
         # 一旦本轮确实点过提交，后续看到验证码框就直接交给验证码步骤处理。
@@ -996,12 +1131,24 @@ function emailCandidates() {
     return Array.from(new Set(direct));
 }
 const visibleInputs = Array.from(document.querySelectorAll('input, textarea'))
-    .filter((node) => isVisible(node) && !node.disabled && !node.readOnly)
-    .map(describeInput)
+    .filter((node) => {
+        if (!isVisible(node)) return false;
+        const type = (node.getAttribute('type') || '').toLowerCase();
+        return !['hidden', 'submit', 'button', 'checkbox', 'radio', 'file'].includes(type);
+    })
+    .map((node) => {
+        const label = describeInput(node);
+        return (node.disabled || node.readOnly) ? `[locked] ${label}` : label;
+    })
     .slice(0, 8);
 const visibleActions = Array.from(document.querySelectorAll('button, a, [role="button"]'))
-    .filter((node) => isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true')
-    .map(describeAction)
+    .filter((node) => isVisible(node))
+    .map((node) => {
+        const loading = node.disabled || node.getAttribute('aria-disabled') === 'true' || node.getAttribute('aria-busy') === 'true';
+        const label = describeAction(node);
+        if (!label && !loading) return '';
+        return loading ? `[loading] ${label}`.trim() : label;
+    })
     .filter(Boolean)
     .slice(0, 10);
 const input = emailCandidates().find((node) => isVisible(node) && !node.disabled && !node.readOnly) || null;
@@ -1052,6 +1199,27 @@ return {
                 if log_callback:
                     log_callback(f"[*] 邮箱提交后已延迟进入验证码页: {email}")
                 return email, dev_token, last_submit_clicked_at
+            controls = _email_submit_controls()
+            if isinstance(controls, dict) and controls.get("email_input"):
+                saw_email_input = True
+                last_snapshot = controls
+                if controls.get("submit") == "loading":
+                    _begin_button_wait()
+                if log_callback and now - last_diag_time >= 5:
+                    last_diag_time = now
+                    if controls.get("submit") == "loading":
+                        log_callback(
+                            "[Debug] 邮箱已填、正在等待主按钮可用: "
+                            + _controls_suffix(controls)
+                        )
+                    else:
+                        log_callback(
+                            "[Debug] 邮箱输入框已出现，继续等待可提交: "
+                            + _controls_suffix(controls)
+                        )
+                # 邮箱框已经在页面上。不要再点注册方式，也不要把 loading 按钮当成不存在。
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
             if now - last_reclick_time >= 3:
                 reclicked = page.run_js(r"""
 function isVisible(node) {
@@ -1123,6 +1291,23 @@ return candidates[0].text || true;
                 log_callback(f"[Debug] 等待邮箱输入框: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}")
             sleep_with_cancel(0.5, cancel_callback)
             continue
+        if state == "filled":
+            saw_email_input = True
+            ready_controls = _email_submit_controls()
+            if ready_controls:
+                last_snapshot = ready_controls
+            # 主按钮只是 disabled / aria-disabled / 转圈时，不要点 Enter 或 requestSubmit，
+            # 也不要当成按钮不存在。等它可用，时间从这里另计，不超过本步骤 timeout。
+            if ready_controls.get("submit") == "loading":
+                _begin_button_wait()
+                if log_callback and time.time() - last_diag_time >= 5:
+                    last_diag_time = time.time()
+                    log_callback(
+                        "[Debug] 邮箱已填、正在等待主按钮可用: "
+                        + _controls_suffix(ready_controls)
+                    )
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
         if state != "filled":
             if log_callback:
                 log_callback(f"[Debug] 邮箱输入框已出现，但写入失败: {filled}")
@@ -1237,20 +1422,39 @@ return 'enter';
                 last_diag_time = time.time()
                 log_callback(f"[Debug] 已点击注册但页面未前进，重试提交: {email}")
             raise_if_email_domain_rejected(email)
+        else:
+            controls = _email_submit_controls()
+            if isinstance(controls, dict) and controls.get("email_input"):
+                saw_email_input = True
+                last_snapshot = controls
+            if isinstance(controls, dict) and controls.get("submit") == "loading":
+                _begin_button_wait()
+                if log_callback and time.time() - last_diag_time >= 5:
+                    last_diag_time = time.time()
+                    log_callback(
+                        "[Debug] 邮箱已填、正在等待主按钮可用: "
+                        + _controls_suffix(controls)
+                    )
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
         sleep_with_cancel(0.5, cancel_callback)
     if last_submit_clicked_at is not None and _has_code_verification_input():
         if log_callback:
             log_callback(f"[*] 邮箱提交后已延迟进入验证码页: {email}")
         return email, dev_token, last_submit_clicked_at
     raise_if_email_domain_rejected(email)
-    if last_snapshot:
-        inputs = " | ".join(last_snapshot.get("inputs", [])[:6])
-        buttons = " | ".join(last_snapshot.get("buttons", [])[:8])
-        url = last_snapshot.get("url", page.url if page else "")
-        raise Exception(
-            f"未找到邮箱输入框或注册按钮，最后页面: url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
-        )
-    raise Exception("未找到邮箱输入框或注册按钮")
+    controls = _email_submit_controls()
+    if controls:
+        last_snapshot = controls
+        if controls.get("email_input"):
+            saw_email_input = True
+    detail = _controls_suffix(last_snapshot if isinstance(last_snapshot, dict) else {})
+    suffix = f"，最后页面: {detail}" if detail else ""
+    if last_submit_clicked_at is not None:
+        raise Exception(f"已点击注册但页面未前进{suffix}")
+    if saw_email_input or controls.get("submit") == "loading":
+        raise Exception(f"邮箱已填、正在等待主按钮可用{suffix}")
+    raise Exception(f"点击注册方式后页面未跳转{suffix}")
 
 
 def fill_code_and_submit(

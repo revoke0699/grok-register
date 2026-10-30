@@ -23,7 +23,7 @@ import time
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, quote, urlsplit
 
-from backend.mailbox.utilities import extract_verification_code
+from backend.mailbox.utilities import extract_verification_code, strip_html
 
 API_BASE_DEFAULT = "https://mail.veilimage.com"
 PROVIDER_ID = "icloud"
@@ -36,8 +36,38 @@ HttpGet = Callable[..., Any]
 EntryPair = Tuple[str, str]
 _HEX_SUFFIX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _CODE_TOKEN_RE = re.compile(r"^[A-Za-z0-9-]{4,32}$")
+_FOUR_DIGIT_CODE_RE = re.compile(r"^\d{4}$")
+_SIX_DIGIT_CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _PLACEHOLDER_CODES = {"null", "none", "false", "true", "undefined"}
+_CODE_FIELD_HINTS = ("code", "otp", "verify", "captcha", "pin")
+_SKIP_BARE_DIGIT_KEYS = {
+    "id",
+    "uid",
+    "timestamp",
+    "time",
+    "ts",
+    "count",
+    "status",
+    "key",
+    "code_key",
+    "token",
+}
+_TEXT_FIELD_NAMES = {
+    "subject",
+    "text",
+    "html",
+    "body",
+    "content",
+    "message",
+    "msg",
+    "mail",
+    "preview",
+    "snippet",
+    "raw",
+    "title",
+    "description",
+}
 
 _next_email_index = 0
 _next_email_lock = threading.Lock()
@@ -384,22 +414,165 @@ def _dig(payload, *path):
     return current
 
 
+def _leaf_text(value) -> Optional[str]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not float(value).is_integer():
+            return None
+        return str(int(value))
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _iter_named_leaves(value, key: str = ""):
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            yield from _iter_named_leaves(child, str(child_key))
+        return
+    if isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _iter_named_leaves(child, key)
+        return
+    text = _leaf_text(value)
+    if text is not None and str(text).strip():
+        yield key.lower(), str(text)
+
+
+def _is_four_digit_code(value) -> bool:
+    text = _leaf_text(value)
+    if text is None:
+        return False
+    return bool(_FOUR_DIGIT_CODE_RE.fullmatch(str(text).strip()))
+
+
+def _signup_code_length(code: str) -> int:
+    """注册页按去掉连字符后的字符数占格。"""
+    return len(re.sub(r"-", "", str(code or "").strip()))
+
+
+def _code_fills_six_boxes(code: str) -> bool:
+    """页面要 6 格时，去掉连字符后不足 6 位不能当成已取到。
+
+    只拦填不满 6 格的短码（典型是 code 字段里的 4 位纯数字）。
+    6 位数字、带连字符但仍占 6 格的码，以及更长的字母数字码都保留，
+    避免把原来能用的非 6 位格式整段丢掉。
+    """
+    return bool(code) and _signup_code_length(code) >= 6
+
+
+def _searchable_text(text: str) -> str:
+    raw = str(text or "")
+    if "<" in raw:
+        return strip_html(raw)
+    return raw
+
+
+def _skip_bare_digits(key: str, text: str) -> bool:
+    """不从 id、时间、key，或整段 JSON 里直接抠 6 位数字。
+
+    整段 JSON 仍走带“验证码”上下文的提取。避免把取码参数里的数字当成验证码。
+    """
+    name = str(key or "").lower()
+    if (
+        name in _SKIP_BARE_DIGIT_KEYS
+        or name.endswith("_id")
+        or name.endswith("_key")
+        or name.endswith("_at")
+    ):
+        return True
+    return str(text or "").lstrip()[:1] in "{["
+
+
+def _code_from_other_fields(leaves) -> Optional[str]:
+    """code 字段是 4 位纯数字时，到其他字段和文本里继续找。
+
+    优先独立的 6 位数字。找不到时才接受原来能用、且填得满 6 格的其它格式。
+    """
+    contextual_six = []
+    contextual_other = []
+    bare_in_sentence = []
+    exact_named = []
+    exact_other = []
+    for key, text in leaves:
+        stripped = _searchable_text(str(text or "")).strip()
+        if not stripped or _is_four_digit_code(stripped):
+            continue
+        extracted = extract_verification_code(stripped)
+        if extracted and _code_fills_six_boxes(extracted) and not _is_four_digit_code(extracted):
+            compact = extracted.replace("-", "")
+            if compact.isdigit() and len(compact) == 6:
+                contextual_six.append(extracted)
+            else:
+                contextual_other.append(extracted)
+        if _skip_bare_digits(key, str(text or "")):
+            continue
+        if len(stripped) > 6:
+            match = _SIX_DIGIT_CODE_RE.search(stripped)
+            if match:
+                bare_in_sentence.append(match.group(1))
+        if re.fullmatch(r"\d{6}", stripped):
+            named = any(hint in key for hint in _CODE_FIELD_HINTS) or key in _TEXT_FIELD_NAMES
+            if named:
+                exact_named.append(stripped)
+            else:
+                exact_other.append(stripped)
+    for bucket in (contextual_six, exact_named, bare_in_sentence, contextual_other, exact_other):
+        if bucket:
+            return bucket[0]
+    return None
+
+
+def _choose_code(fields, leaves) -> Optional[str]:
+    """优先 6 位数字。code 字段本身是 4 位纯数字时不直接返回。"""
+    skipped_short = False
+    fallback = None
+    for raw in fields:
+        if raw is None:
+            continue
+        if _is_four_digit_code(raw):
+            skipped_short = True
+            continue
+        code = _as_code(raw)
+        if not code:
+            continue
+        if _is_four_digit_code(code) or not _code_fills_six_boxes(code):
+            skipped_short = True
+            continue
+        compact = code.replace("-", "")
+        if compact.isdigit() and len(compact) == 6:
+            return code
+        if fallback is None:
+            fallback = code
+    if skipped_short or fallback is None:
+        found = _code_from_other_fields(leaves)
+        if found and _code_fills_six_boxes(found):
+            return found
+    return fallback
+
+
 def _code_from_payload(payload) -> Optional[str]:
-    if isinstance(payload, (str, int, float)):
-        return _as_code(payload)
+    if isinstance(payload, (str, int, float)) and not isinstance(payload, bool):
+        leaves = list(_iter_named_leaves(payload))
+        return _choose_code([payload], leaves)
+    if isinstance(payload, (list, tuple)):
+        return _choose_code([], list(_iter_named_leaves(payload)))
     if not isinstance(payload, dict):
         return None
-    for path in (
-        ("data", "code"),
-        ("code",),
-        ("verification_code",),
-        ("data", "verification_code"),
-        ("data", "data", "code"),
-    ):
-        code = _as_code(_dig(payload, *path))
-        if code:
-            return code
-    return None
+    fields = [
+        _dig(payload, *path)
+        for path in (
+            ("data", "code"),
+            ("code",),
+            ("verification_code",),
+            ("data", "verification_code"),
+            ("data", "data", "code"),
+        )
+    ]
+    return _choose_code(fields, list(_iter_named_leaves(payload)))
 
 
 def _response_text(resp) -> str:
@@ -430,15 +603,27 @@ def _response_payload(resp):
 
 def _code_from_response(resp) -> Optional[str]:
     payload = _response_payload(resp)
+    text = _response_text(resp)
     if payload is not None:
         code = _code_from_payload(payload)
-        if code:
+        if code and _code_fills_six_boxes(code):
             return code
-    text = _response_text(resp)
+        # JSON 的 code 字段若只是 4 位纯数字，上面不会把它当成验证码。
+        # 继续在原始响应文本里找 6 位码，短码留空，交给轮询。
+        if text:
+            found = _code_from_other_fields([("text", text)])
+            if found and _code_fills_six_boxes(found):
+                return found
+        return None
+    if not text:
+        return None
     code = _as_code(text)
-    if code:
+    if code and _code_fills_six_boxes(code) and not _is_four_digit_code(code):
         return code
-    return extract_verification_code(text)
+    found = _code_from_other_fields([("text", text)])
+    if found and _code_fills_six_boxes(found):
+        return found
+    return None
 
 
 def fetch_code(http_get: HttpGet, api_base: str, code_key: str) -> Optional[str]:
@@ -497,6 +682,16 @@ def wait_for_code(
                 log_callback(f"[Debug] iCloud 取码失败: {_redact_key(exc, key)}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
+        if code and not _code_fills_six_boxes(code):
+            # 页面要 6 格。去掉连字符后不足 6 位时不要当成已取到，
+            # 也不要进入填写；在本次 wait_for_code 超时内继续轮询。
+            # 只拦填不满 6 格的短码，6 位数字和更长或仍占满 6 格的码照常返回。
+            if log_callback:
+                log_callback(
+                    "[Debug] iCloud 验证码去掉连字符后长度不足 6，"
+                    "页面要 6 格，继续轮询"
+                )
+            code = None
         if code:
             if log_callback:
                 log_callback(f"[*] iCloud 从取码接口提取到验证码: {code}")

@@ -27,7 +27,7 @@ import { AccountEmailIcon, EmailProviderLabel, emailProviderLabel } from "@/comp
 import { AccountFilterBar, AccountSelectionToolbar } from "@/components/AccountTableToolbar";
 import { api, type AccountRecord, type ReloginStatus } from "@/lib/api";
 import { appendReloginHistory } from "@/lib/reloginHistory";
-import { cn, copyText, formatDuration, maskSecret } from "@/lib/utils";
+import { cn, copyText, failureTypeLabel, formatDuration, maskSecret } from "@/lib/utils";
 import {
   Badge,
   Button,
@@ -618,7 +618,7 @@ function AccountDetails({
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-[7rem_minmax(0,1fr)]">
               <div className="text-xs font-medium text-red-700">异常类型</div>
               <div className="break-words text-sm text-slate-800">
-                {detail.failure_type === "invalid_credentials" ? "账号密码错误" : (detail.failure_type || detail.exception_type || "未分类异常")}
+                {failureTypeLabel(detail.failure_type) || detail.exception_type || "未分类异常"}
               </div>
               <div className="text-xs font-medium text-red-700">异常原因</div>
               <div className="whitespace-pre-wrap break-words text-sm leading-6 text-slate-800">

@@ -39,7 +39,7 @@ import {
   Toast,
   buttonVariants,
 } from "@/components/ui";
-import { cn } from "@/lib/utils";
+import { cn, failureTypeLabel } from "@/lib/utils";
 
 type BusyAction = "" | "start" | "stop" | "check" | "kill";
 type LogTone = "default" | "success" | "error" | "warn" | "info";
@@ -925,7 +925,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                                   {item.email || `记录 #${item.id}`}
                                 </span>
                                 <span className="mt-0.5 block truncate text-xs text-slate-500">
-                                  {[item.provider, item.failure_type || item.failure_reason, item.finished_at]
+                                  {[item.provider, failureTypeLabel(item.failure_type) || item.failure_reason, item.finished_at]
                                     .filter(Boolean)
                                     .join(" · ") || "点击查看详情"}
                                 </span>
@@ -1305,7 +1305,7 @@ export function RegisterPage({ view = "new" }: { view?: "new" | "runtime" }) {
                     ["邮箱", resultDetail.email || "—"],
                     ["完成时间", resultDetail.finished_at || "—"],
                     ["耗时", resultDetail.duration_seconds ? `${Math.round(resultDetail.duration_seconds)}s` : "—"],
-                    ["失败类型", resultDetail.failure_type || "—"],
+                    ["失败类型", failureTypeLabel(resultDetail.failure_type) || "—"],
                     ["失败原因", resultDetail.failure_reason || "—"],
                     ["批次", resultDetail.batch_id || job?.batch_id || "—"],
                     ["CPA", resultDetail.cpa_status || "—"],
