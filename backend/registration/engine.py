@@ -535,6 +535,8 @@ def apply_risk_bot_flag(cpa_detail: dict, exc) -> bool:
 
 
 FAIL_DOMAIN = "domain_rejected"
+FAIL_EMAIL_SIGNUP_UNAVAILABLE = "email_signup_unavailable"
+FAIL_CODE_REQUEST_LIMITED = "code_request_limited"
 FAIL_ALREADY_REGISTERED = "already_registered"
 FAIL_RISK = "registration_risk"
 FAIL_CODE = "code_timeout"
@@ -548,6 +550,8 @@ FAIL_OTHER = "other"
 
 FAIL_LABELS = {
     FAIL_DOMAIN: "域名拒绝",
+    FAIL_EMAIL_SIGNUP_UNAVAILABLE: "邮箱注册暂不可用",
+    FAIL_CODE_REQUEST_LIMITED: "发码过于频繁",
     FAIL_ALREADY_REGISTERED: "账号已注册",
     FAIL_RISK: "注册风控",
     FAIL_CODE: "验证码超时",
@@ -569,6 +573,10 @@ def classify_failure(exc) -> str:
 
     if isinstance(exc, EmailDomainRejected):
         return FAIL_DOMAIN
+    if isinstance(exc, _rf.EmailSignupUnavailable):
+        return FAIL_EMAIL_SIGNUP_UNAVAILABLE
+    if isinstance(exc, _rf.CodeRequestLimited):
+        return FAIL_CODE_REQUEST_LIMITED
     if isinstance(exc, _rf.AccountAlreadyRegistered):
         return FAIL_ALREADY_REGISTERED
     if isinstance(exc, RegistrationRiskDenied):

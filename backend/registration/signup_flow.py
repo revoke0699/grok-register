@@ -37,6 +37,14 @@ class AccountAlreadyRegistered(Exception):
     """资料提交后站点明确提示邮箱或账号已经存在。"""
 
 
+class EmailSignupUnavailable(Exception):
+    """页面明确拒绝邮箱注册。不要继续重试 Sign up。"""
+
+
+class CodeRequestLimited(Exception):
+    """页面提示发码过于频繁。不要继续重试 Sign up。"""
+
+
 _ALREADY_REGISTERED_PATTERNS = (
     re.compile(r"existing account found", re.I),
     re.compile(r"email.{0,80}already.{0,40}(?:registered|exists|in use|used|taken)", re.I),
@@ -134,11 +142,21 @@ def _native_elements(tag: str):
         return []
 
 
-def _native_click_action(keywords, deny_keywords=()) -> str:
-    """按可见文本用 CDP 原生事件点击；返回按钮文字。"""
+def _native_click_action(keywords, deny_keywords=(), *, report_method=False):
+    """按可见文本用 CDP 原生事件点击；返回按钮文字。
+
+    report_method=True 时返回 (文字, "native"|"by_js")。未点到时普通调用返回 ""，
+    带 report_method 时返回 ("", "")。其他调用方保持原来的字符串返回。
+    """
     keys = [str(x).replace(" ", "").lower() for x in keywords]
     denied = [str(x).replace(" ", "").lower() for x in deny_keywords]
     candidates = []
+
+    def _pack(label, method=""):
+        if report_method:
+            return (label, method) if label else ("", "")
+        return label
+
     for tag in ("button", "a", "input"):
         for element in _native_elements(tag):
             if not _native_is_usable(element):
@@ -160,15 +178,15 @@ def _native_click_action(keywords, deny_keywords=()) -> str:
     for _, element, label in sorted(candidates, key=lambda item: item[0], reverse=True):
         try:
             element.click(timeout=3)
-            return label
+            return _pack(label, "native")
         except Exception:
             # 原生点击失败（可能被 Cookie 横幅等覆盖），尝试 JS 直接点击
             try:
                 element.click(by_js=True)
-                return label
+                return _pack(label, "by_js")
             except Exception:
                 continue
-    return ""
+    return _pack("")
 
 
 def _native_type_element(element, value: str, per_char: bool = True) -> bool:
@@ -754,6 +772,200 @@ def raise_if_email_domain_rejected(email=""):
         raise _deps['EmailDomainRejected'](email=email, message=message)
 
 
+_EMAIL_IN_TEXT_RE = re.compile(r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}", re.I)
+_LONG_SECRET_RE = re.compile(r"\b[A-Za-z0-9_\-]{32,}\b")
+# 标点去掉后再匹配，兼容直引号、弯引号和多余空格。
+_EMAIL_SIGNUP_UNAVAILABLE_RE = re.compile(
+    r"("
+    r"email sign ?up (isn'?t|isnt|is not|not) available"
+    r"|email sign ?up (is )?unavailable"
+    r"|邮箱注册.{0,8}不可用"
+    r"|暂不支持邮箱注册"
+    r"|无法使用邮箱注册"
+    r")"
+)
+_CODE_REQUEST_LIMITED_RE = re.compile(
+    r"("
+    r"too many code requests?"
+    r"|too many verification codes?"
+    r"|wait a few minutes before requesting another code"
+    r"|requesting another code"
+    r"|发码过于频繁"
+    r"|请求验证码过于频繁"
+    r"|验证码请求过于频繁"
+    r"|请稍[等候].{0,12}再(请求|获取|发送).{0,8}(验证码|代码)"
+    r")"
+)
+_TURNSTILE_VERIFY_FAILED_RE = re.compile(r"verification failed|验证失败", re.I)
+
+
+def _normalize_notice(text: str) -> str:
+    folded = str(text or "").lower()
+    folded = (
+        folded.replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("`", "'")
+        .replace("´", "'")
+    )
+    folded = re.sub(r"[^\w\s'\u4e00-\u9fff]+", " ", folded)
+    return re.sub(r"\s+", " ", folded).strip()
+
+
+def _scrub_notice(text: str) -> str:
+    """日志和失败快照只留红字本身，去掉邮箱和长串密钥。"""
+    cleaned = _EMAIL_IN_TEXT_RE.sub("[email]", str(text or ""))
+    cleaned = _LONG_SECRET_RE.sub("[secret]", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()[:180]
+
+
+def _match_email_submit_rejection(text: str) -> str:
+    normalized = _normalize_notice(text)
+    if not normalized:
+        return ""
+    if _CODE_REQUEST_LIMITED_RE.search(normalized):
+        return "code_request_limited"
+    if _EMAIL_SIGNUP_UNAVAILABLE_RE.search(normalized):
+        return "email_signup_unavailable"
+    return ""
+
+
+def _visible_status_notices() -> list:
+    """只收集可见的短错误/红字，不取整页正文，也不读输入框的值。"""
+    if not page:
+        return []
+    try:
+        result = page.run_js(
+            r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function looksRed(node) {
+    const color = (window.getComputedStyle(node).color || '');
+    const match = color.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+    if (!match) return false;
+    const red = Number(match[1]);
+    const green = Number(match[2]);
+    const blue = Number(match[3]);
+    return red >= 150 && red > green + 30 && red > blue + 30;
+}
+const selectors = [
+    '[role="alert"]',
+    '[aria-live="assertive"]',
+    '[aria-live="polite"]',
+    '[data-testid*="error" i]',
+    '[class*="error" i]',
+    '[class*="Error"]',
+    '[class*="danger" i]',
+    '[class*="invalid" i]',
+];
+const nodes = [];
+for (const sel of selectors) {
+    for (const node of Array.from(document.querySelectorAll(sel)).slice(0, 40)) nodes.push(node);
+}
+function looksLikeNotice(text) {
+    const folded = text.toLowerCase().replace(/[’`´]/g, "'");
+    return (
+        folded.includes("isn't available") || folded.includes('isnt available') ||
+        folded.includes('is not available') || folded.includes('sign up another way') ||
+        folded.includes('too many code') || folded.includes('another code') ||
+        folded.includes('verification failed') ||
+        text.includes('邮箱注册') || text.includes('发码过于频繁') ||
+        text.includes('验证失败') || text.includes('验证码请求') || text.includes('请求验证码')
+    );
+}
+for (const node of Array.from(document.querySelectorAll('p, span, div, li')).slice(0, 200)) {
+    if (!isVisible(node)) continue;
+    const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text.length < 8 || text.length > 180) continue;
+    if (looksRed(node) || looksLikeNotice(text)) nodes.push(node);
+}
+const chunks = [];
+for (const node of nodes) {
+    if (!isVisible(node)) continue;
+    const text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text.length < 8 || text.length > 180) continue;
+    chunks.push(text);
+}
+return Array.from(new Set(chunks)).slice(0, 8);
+            """
+        )
+    except Exception:
+        return []
+    if not isinstance(result, list):
+        return []
+    notices = []
+    for item in result:
+        text = _scrub_notice(item)
+        if text and text not in notices:
+            notices.append(text)
+    return notices
+
+
+def _email_submit_observation(click_method, controls=None, red_text="") -> str:
+    button = "missing"
+    red = _scrub_notice(red_text) if red_text else ""
+    if isinstance(controls, dict):
+        button = str(controls.get("button_state") or controls.get("submit") or "missing")
+        if not red:
+            notices = controls.get("notices") or []
+            if isinstance(notices, list):
+                red = " | ".join(
+                    _scrub_notice(item) for item in notices[:3] if _scrub_notice(item)
+                )
+            else:
+                red = _scrub_notice(notices)
+    return (
+        f"submit={button}; click={click_method or 'unknown'}; "
+        f"红字={red or '无'}"
+    )
+
+
+def _raise_email_submit_rejection(kind, red_text, click_method="", log_callback=None, controls=None):
+    if not isinstance(controls, dict) or not controls:
+        controls = _email_submit_controls()
+    observation = _email_submit_observation(click_method, controls, red_text)
+    if log_callback:
+        log_callback(f"[*] 邮箱提交被页面拒绝，停止重试: {observation}")
+    suffix = _controls_suffix(controls if isinstance(controls, dict) else {})
+    page_part = f"，最后页面: {suffix}" if suffix else ""
+    if kind == "code_request_limited":
+        raise CodeRequestLimited(f"发码过于频繁{page_part}; {observation}")
+    raise EmailSignupUnavailable(f"邮箱注册暂不可用{page_part}; {observation}")
+
+
+def raise_if_email_submit_rejected(click_method="", log_callback=None, controls=None):
+    notices = []
+    if isinstance(controls, dict):
+        notices = list(controls.get("notices") or [])
+    if not notices:
+        notices = _visible_status_notices()
+        if isinstance(controls, dict):
+            controls = dict(controls)
+            controls["notices"] = notices
+    for text in notices:
+        kind = _match_email_submit_rejection(text)
+        if kind:
+            _raise_email_submit_rejection(
+                kind,
+                text,
+                click_method=click_method,
+                log_callback=log_callback,
+                controls=controls,
+            )
+            return
+
+
+def detect_turnstile_verification_failed() -> str:
+    for text in _visible_status_notices():
+        if _TURNSTILE_VERIFY_FAILED_RE.search(_normalize_notice(text)):
+            return _scrub_notice(text)
+    return ""
+
+
 def _has_code_verification_input() -> bool:
     """检测当前页面是否已经进入邮箱验证码阶段。
 
@@ -882,11 +1094,18 @@ return false;
         return False
 
 
-def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
+def _wait_email_page_advanced(
+    email,
+    wait=4.0,
+    cancel_callback=None,
+    log_callback=None,
+    click_method="",
+):
     """点击提交后，在有限窗口内轮询确认页面确实前进。
 
     给页面/网络一点反应时间：若窗口内检测到已前进则返回 True，
     否则返回 False，由调用方继续重试点击或最终超时换邮箱。
+    红字一出现就抛出对应拒绝，不再把剩余窗口睡完。
     """
     deadline = time.time() + wait
     while time.time() < deadline:
@@ -894,8 +1113,10 @@ def _wait_email_page_advanced(email, wait=4.0, cancel_callback=None):
         raise_if_email_domain_rejected(email)
         if _email_page_advanced_once(email):
             return True
+        raise_if_email_submit_rejected(click_method=click_method, log_callback=log_callback)
         sleep_with_cancel(0.4, cancel_callback)
     raise_if_email_domain_rejected(email)
+    raise_if_email_submit_rejected(click_method=click_method, log_callback=log_callback)
     return False
 
 
@@ -904,12 +1125,22 @@ def _controls_suffix(controls) -> str:
         return ""
     inputs = controls.get("inputs") or []
     buttons = controls.get("buttons") or []
+    notices = controls.get("notices") or []
     if isinstance(inputs, list):
         inputs = " | ".join(str(item) for item in inputs[:6] if str(item or "").strip())
     if isinstance(buttons, list):
         buttons = " | ".join(str(item) for item in buttons[:8] if str(item or "").strip())
+    if isinstance(notices, list):
+        notices = " | ".join(
+            _scrub_notice(item) for item in notices[:4] if _scrub_notice(item)
+        )
+    else:
+        notices = _scrub_notice(notices)
     url = controls.get("url") or (page.url if page else "")
-    return f"url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}"
+    return (
+        f"url={url}; inputs={inputs or 'none'}; buttons={buttons or 'none'}; "
+        f"红字={notices or '无'}"
+    )
 
 
 def _email_submit_controls() -> dict:
@@ -995,22 +1226,32 @@ const describedInputs = Array.from(document.querySelectorAll('input, textarea'))
     return locked ? `[locked] ${label}` : label;
 });
 let submit = 'missing';
+let buttonState = 'missing';
 const enabledMain = buttons.find((node) => isMainButton(node) && !isLoading(node));
 const loadingMain = buttons.find((node) => isMainButton(node) && isLoading(node));
-if (enabledMain) submit = 'enabled';
-else if (loadingMain) submit = 'loading';
-else if (emailInput) {
+if (enabledMain) {
+    submit = 'enabled';
+    buttonState = 'enabled';
+} else if (loadingMain) {
+    submit = 'loading';
+    const busy = (loadingMain.getAttribute('aria-busy') || '').toLowerCase() === 'true';
+    buttonState = busy ? 'loading' : 'disabled';
+} else if (emailInput) {
     const form = emailInput.closest('form');
     const scoped = form
         ? Array.from(form.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(isVisible)
         : [];
-    if (scoped.length > 0 && scoped.every(isLoading)) submit = 'loading';
+    if (scoped.length > 0 && scoped.every(isLoading)) {
+        submit = 'loading';
+        buttonState = 'disabled';
+    }
 }
 return {
     url: location.href,
     email_input: !!emailInput,
     email_ready: !!(emailInput && !emailInput.disabled && !emailInput.readOnly),
     submit,
+    button_state: buttonState,
     inputs: describedInputs,
     buttons: describedButtons,
 };
@@ -1018,7 +1259,10 @@ return {
         )
     except Exception:
         return {}
-    return result if isinstance(result, dict) else {}
+    if not isinstance(result, dict):
+        return {}
+    result["notices"] = _visible_status_notices()
+    return result
 
 
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
@@ -1062,6 +1306,8 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
     last_reclick_time = 0
     last_snapshot = None
     last_submit_clicked_at = None
+    last_click_method = ""
+    submit_attempt = 0
 
     def _begin_button_wait():
         nonlocal button_wait_deadline, loop_deadline
@@ -1077,6 +1323,12 @@ def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
             if log_callback:
                 log_callback(f"[*] 邮箱提交后已延迟进入验证码页: {email}")
             return email, dev_token, last_submit_clicked_at
+        # 红字已经出现就不要再填、再点。验证码框优先，仍算页面前进。
+        if last_submit_clicked_at is not None:
+            raise_if_email_submit_rejected(
+                click_method=last_click_method,
+                log_callback=log_callback,
+            )
         native_filled = _native_fill_email(email)
         if native_filled:
             filled = {"state": "filled", "source": "native", "url": page.url if page else ""}
@@ -1199,6 +1451,11 @@ return {
                 if log_callback:
                     log_callback(f"[*] 邮箱提交后已延迟进入验证码页: {email}")
                 return email, dev_token, last_submit_clicked_at
+            if last_submit_clicked_at is not None:
+                raise_if_email_submit_rejected(
+                    click_method=last_click_method,
+                    log_callback=log_callback,
+                )
             controls = _email_submit_controls()
             if isinstance(controls, dict) and controls.get("email_input"):
                 saw_email_input = True
@@ -1315,7 +1572,7 @@ return candidates[0].text || true;
             continue
         sleep_with_cancel(0.8, cancel_callback)
         submit_clicked_at = time.time()
-        clicked = _native_click_action(
+        clicked, click_method = _native_click_action(
             (
                 "注册", "继续", "下一步", "确认", "sign up", "signup", "continue", "next", "create account",
                 # 西班牙语
@@ -1331,6 +1588,7 @@ return candidates[0].text || true;
                 # 日语
                 "登録",
             ),
+            report_method=True,
         )
         if not clicked:
             submit_clicked_at = time.time()
@@ -1408,19 +1666,42 @@ input.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bu
 return 'enter';
                 """
             )
+            if clicked:
+                click_method = "by_js"
         if clicked:
             last_submit_clicked_at = submit_clicked_at
+            last_click_method = click_method or "unknown"
+            submit_attempt += 1
+            click_controls = _email_submit_controls()
+            if isinstance(click_controls, dict) and click_controls:
+                last_snapshot = click_controls
+            if log_callback:
+                log_callback(
+                    f"[*] 邮箱提交轮询: 第{submit_attempt}次 "
+                    + _email_submit_observation(last_click_method, click_controls)
+                )
+            # 红字可能就在这次点击后立刻出现，先停，再进入短轮询。
+            raise_if_email_submit_rejected(
+                click_method=last_click_method,
+                log_callback=log_callback,
+                controls=click_controls,
+            )
             # 点击按钮 != 表单真正提交成功：CF 挑战未过或页面卡住时点击无效果，
             # 邮件不会发出。必须确认页面已离开邮箱输入阶段（邮箱框消失或出现验证码框），
             # 否则继续循环重试点击，最终超时抛异常触发换邮箱重试。
-            if _wait_email_page_advanced(email, cancel_callback=cancel_callback):
+            if _wait_email_page_advanced(
+                email,
+                cancel_callback=cancel_callback,
+                log_callback=log_callback,
+                click_method=last_click_method,
+            ):
                 if log_callback:
                     detail = f" ({clicked})" if isinstance(clicked, str) else ""
                     log_callback(f"[*] 已填写邮箱并提交: {email}{detail}")
                 return email, dev_token, submit_clicked_at
             if log_callback and time.time() - last_diag_time >= 5:
                 last_diag_time = time.time()
-                log_callback(f"[Debug] 已点击注册但页面未前进，重试提交: {email}")
+                log_callback("[Debug] 已点击注册但页面未前进，重试提交")
             raise_if_email_domain_rejected(email)
         else:
             controls = _email_submit_controls()
@@ -1443,6 +1724,11 @@ return 'enter';
             log_callback(f"[*] 邮箱提交后已延迟进入验证码页: {email}")
         return email, dev_token, last_submit_clicked_at
     raise_if_email_domain_rejected(email)
+    if last_submit_clicked_at is not None:
+        raise_if_email_submit_rejected(
+            click_method=last_click_method,
+            log_callback=log_callback,
+        )
     controls = _email_submit_controls()
     if controls:
         last_snapshot = controls
@@ -1903,6 +2189,39 @@ def build_profile():
     return given_name, family_name, password
 
 
+def _turnstile_failure_notice(token_len) -> str:
+    try:
+        length = int(str(token_len or "0").strip() or "0")
+    except ValueError:
+        length = 0
+    if length != 0:
+        return ""
+    return detect_turnstile_verification_failed()
+
+
+def _reload_profile_page_once(log_callback, cancel_callback, notice: str) -> bool:
+    """资料页验证失败时只刷新一次。失败则交给原来的等待路径，不再刷新。"""
+    if log_callback:
+        log_callback(
+            "[*] 资料页 Turnstile token 长度为 0，页面提示验证失败，刷新一次后重新获取 token: "
+            f"红字={notice}"
+        )
+    raise_if_cancelled(cancel_callback)
+    try:
+        page.raw_page.reload(wait_until="domcontentloaded", timeout=45_000)
+    except Exception:
+        try:
+            page.reload()
+        except Exception as exc:
+            if log_callback:
+                log_callback(
+                    f"[*] 资料页刷新失败，按原有失败路径继续: {type(exc).__name__}"
+                )
+            return False
+    sleep_with_cancel(1.0, cancel_callback)
+    return True
+
+
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
     given_name, family_name, password = build_profile()
     _runtime.last_profile = {
@@ -1917,6 +2236,29 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     last_cf_log_at = 0.0
     last_logged_token_len = None
     last_form_diag_at = 0.0
+    profile_cf_refreshed = False
+    profile_cf_fallback_logged = False
+
+    def _handle_profile_turnstile_failure(token_len) -> bool:
+        nonlocal profile_cf_refreshed, profile_cf_fallback_logged
+        nonlocal form_filled_once, wait_cf_since, last_cf_retry_at, last_logged_token_len
+        notice = _turnstile_failure_notice(token_len)
+        if not notice:
+            return False
+        if profile_cf_refreshed:
+            if not profile_cf_fallback_logged and log_callback:
+                profile_cf_fallback_logged = True
+                log_callback(f"[*] 资料页刷新后验证仍失败，按原有失败路径继续: 红字={notice}")
+            return False
+        reloaded = _reload_profile_page_once(log_callback, cancel_callback, notice)
+        profile_cf_refreshed = True
+        if not reloaded:
+            return False
+        form_filled_once = False
+        wait_cf_since = None
+        last_cf_retry_at = 0.0
+        last_logged_token_len = None
+        return True
 
     def _maybe_log_cf_wait(message, token_len):
         nonlocal last_cf_log_at, last_logged_token_len
@@ -2028,6 +2370,8 @@ return 'filled-no-submit';
                     f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}",
                     token_len,
                 )
+                if _handle_profile_turnstile_failure(token_len):
+                    continue
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
@@ -2132,6 +2476,8 @@ return 'ready-to-submit';
                 f"[*] 等待 Cloudflare 人机验证通过后再提交... 当前token长度={token_len}",
                 token_len,
             )
+            if _handle_profile_turnstile_failure(token_len):
+                continue
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now

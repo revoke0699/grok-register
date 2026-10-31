@@ -9,6 +9,8 @@ export function cn(...inputs: ClassValue[]) {
 // 未知类型回退成原始值，避免界面出现空标签。
 export const FAILURE_TYPE_LABELS: Record<string, string> = {
   domain_rejected: "域名拒绝",
+  email_signup_unavailable: "邮箱注册暂不可用",
+  code_request_limited: "发码过于频繁",
   already_registered: "账号已注册",
   registration_risk: "注册风控",
   code_timeout: "验证码超时",
